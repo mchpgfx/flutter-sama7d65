@@ -1,0 +1,5 @@
+# Nothing generated lives in this layer; keep it that way.
+*.pyc
+__pycache__/
+*.swp
+*~

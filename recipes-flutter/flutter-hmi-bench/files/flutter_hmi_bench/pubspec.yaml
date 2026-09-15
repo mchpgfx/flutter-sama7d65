@@ -1,0 +1,16 @@
+name: flutter_hmi_bench
+description: Scene-based render benchmark for CPU-rasterised Flutter on 800x480.
+publish_to: none
+version: 1.0.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+# Deliberately no dependencies beyond the SDK. Any third-party package risks
+# pulling a Linux plugin, which cannot work in a disable-plugins build.
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

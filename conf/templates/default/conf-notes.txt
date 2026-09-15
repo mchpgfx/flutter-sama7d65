@@ -1,0 +1,20 @@
+Common targets for this configuration:
+
+    mchp-flutter-bench-image   Flutter (Skia CPU -> DRM) + benchmark and demo apps
+    mchp-graphics-image        Microchip stock EGT image (known-good fallback)
+    mchp-gles-probe-image      Mesa software-GLES probes (historical baseline)
+    mchp-headless-image        No graphics stack
+
+MACHINE defaults to sama7d65-curiosity-sd.
+
+Running a Flutter app on the target:
+
+    homescreen -b /usr/share/flutter/<app>/<version>/release
+
+IVI_SW_SINK=drm-dumb and IVI_SW_DRM_FORMAT=rgb565 are exported by
+/etc/profile.d/ivi-homescreen.sh from the ivi-homescreen-defaults recipe. Without
+IVI_SW_SINK the software backend discards every frame and the display stays blank
+with no error.
+
+See README.md in meta-local for the measured GUI design constraints, the required
+host setup (AppArmor), and the silent failure modes.
