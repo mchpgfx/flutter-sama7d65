@@ -71,7 +71,7 @@ mkdir -p ~/bin && curl -sSL https://storage.googleapis.com/git-repo-downloads/re
 chmod a+x ~/bin/repo && export PATH="$HOME/bin:$PATH"
 
 mkdir yocto && cd yocto
-git clone <this-repo-url> meta-local
+git clone ssh://git@bitbucket.microchip.com/mg/flutter.git meta-local
 ./meta-local/setup-workspace.sh
 ```
 

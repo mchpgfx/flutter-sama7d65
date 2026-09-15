@@ -9,7 +9,7 @@
 # already cloned into it:
 #
 #     mkdir yocto && cd yocto
-#     git clone <this-repo> meta-local
+#     git clone ssh://git@bitbucket.microchip.com/mg/flutter.git meta-local
 #     ./meta-local/setup-workspace.sh
 #
 # Host prerequisites (including the mandatory AppArmor profile on Ubuntu 24.04)
