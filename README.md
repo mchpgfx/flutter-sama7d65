@@ -64,36 +64,50 @@ profile bitbake /ABSOLUTE/PATH/TO/bitbake/bin/bitbake flags=(unconfined) {
 then `sudo apparmor_parser -r /etc/apparmor.d/bitbake`. **The path is hardcoded — regenerate
 it if this workspace moves.**
 
-### 2. Fetch
+### 2. Fetch the workspace
 
 ```bash
 mkdir -p ~/bin && curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
 chmod a+x ~/bin/repo && export PATH="$HOME/bin:$PATH"
 
-repo init -u https://github.com/linux4microchip/meta-mchp-manifest.git \
-          -b refs/tags/linux4microchip-2026.04 -m mpu/default.xml
-repo sync -j8 --no-clone-bundle
+mkdir yocto && cd yocto
+git clone <this-repo-url> meta-local
+./meta-local/setup-workspace.sh
 ```
 
-For Flutter, three more layers — cloned **outside** the manifest so `repo sync` cannot revert
-them:
+`setup-workspace.sh` runs `repo init`/`repo sync` for the Microchip BSP at tag
+`linux4microchip-2026.04`, then clones the two layers that are **not** in that manifest —
+`meta-clang` and `meta-flutter` — at **pinned commits** rather than branch tips:
 
-```bash
-git clone -b scarthgap https://github.com/kraj/meta-clang.git
-git clone -b scarthgap https://github.com/meta-flutter/meta-flutter.git
-```
+| Layer | Pinned revision |
+|---|---|
+| `meta-clang` | `cc29beb210ab94eacc53bbd67e287e4e33ede342` (scarthgap) |
+| `meta-flutter` | `719826d2f71076fb616ffea59ee413ad3c62ccba` (scarthgap) |
+
+Pinning matters: following the branch would silently change the Flutter engine version, and
+with it every app bundle. Both live outside the manifest so `repo sync` cannot revert them.
 
 ### 3. Configure
 
 ```bash
-export TEMPLATECONF=../meta-mchp/meta-mchp-mpu/meta-mchp-mpu-apps/conf/templates/default
+export TEMPLATECONF=../meta-local/conf/templates/default
 source openembedded-core/oe-init-build-env build     # never pipe this
-bitbake-layers add-layer ../meta-local ../meta-clang ../meta-flutter \
-                         ../meta-flutter/meta-flutter-apps
 ```
 
-`meta-flutter-apps` is a **separate layer** inside the meta-flutter checkout; without it, its
-~220 third-party app recipes are invisible.
+That is the whole configuration step. The template in this layer seeds
+`build/conf/local.conf` and `build/conf/bblayers.conf` with every setting described in
+[Build configuration](#build-configuration) and the full layer list — including
+`meta-flutter-apps`, which is a **separate layer** inside the meta-flutter checkout and
+easily missed (without it, its ~220 third-party app recipes are invisible and every target
+fails with `Nothing PROVIDES`).
+
+`TEMPLATECONF` is read **only** when `oe-init-build-env` first creates a build directory. To
+pick up template changes later, either point it at a fresh directory or copy the samples over
+`build/conf/` by hand.
+
+`TMPDIR`, `SSTATE_DIR` and `DL_DIR` are `?=` and default to inside `build/`. A Flutter build
+wants **80–120 GB** there; override them in your own `build/conf/local.conf` if that partition
+is small. Note oe-core appends `-glibc`, so `TMPDIR` becomes `tmp-glibc` on disk.
 
 Then in `build/conf/local.conf` set `MACHINE = "sama7d65-curiosity-sd"` and the settings
 described in [Build configuration](#build-configuration).
@@ -162,7 +176,12 @@ is out of date** — its CHANGELOG is authoritative.
 
 ## Build configuration
 
-Key `local.conf` settings, all with reasons:
+These are **already applied** by `conf/templates/default/local.conf.sample` — the list below
+is the rationale, not a checklist to type in. Edit the sample and re-seed (or copy it over
+`build/conf/`) to change them for everyone; edit `build/conf/local.conf` for a local-only
+tweak.
+
+Key settings, all with reasons:
 
 ```
 DISTRO_FEATURES:append = " opengl"      # ONLY because flutter-engine has
@@ -217,21 +236,38 @@ Fallback would be `jit_release` (arch-independent `kernel_blob.bin`), but note m
 JIT path has never been executed: `common.inc` line 521 calls
 `run_command(cmd, source_root, env)`, omitting the leading `d` that all other call sites pass.
 
-## Local modifications (`meta-local`)
+## What is in this layer
 
-All local overrides live here, **outside the `repo` manifest** — edits to
-`openembedded-core` or `meta-mchp` are reverted by `repo sync`.
+`meta-local` is the only version-controlled part of the workspace, and it holds everything
+local: configuration, overrides, the benchmark app and these docs. Everything else is fetched
+by `setup-workspace.sh` — the `repo`-managed layers are pinned by manifest tag, and
+`meta-clang`/`meta-flutter` by explicit commit.
+
+**All overrides live here deliberately.** Edits to `openembedded-core` or `meta-mchp` are
+reverted by `repo sync`, so anything patched there would silently disappear.
 
 | Path | Purpose |
 |---|---|
-| `recipes-devtools/pseudo/pseudo_git.bbappend` | **Load-bearing.** Pins pseudo 1.9.11. Scarthgap's 1.9.0 has no `openat2()` wrapper, so on a modern host (glibc 2.39 / tar 1.35 / kernel 7.x) **every** `do_package` fails with `got *at() syscall for unknown directory`. |
+| `conf/templates/default/` | `TEMPLATECONF` template: `local.conf.sample`, `bblayers.conf.sample`, `conf-notes.txt`. Reproduces the entire build configuration and layer list. |
+| `setup-workspace.sh` | Fetches the BSP via `repo`; clones `meta-clang` and `meta-flutter` at pinned commits. |
+| `recipes-devtools/pseudo/pseudo_git.bbappend` | **Load-bearing — do not remove.** Pins pseudo 1.9.11. Scarthgap's 1.9.0 has no `openat2()` wrapper, so on a modern host (glibc 2.39 / tar 1.35 / kernel 7.x) **every** `do_package` fails with `got *at() syscall for unknown directory`. |
 | `recipes-graphics/toyota/ivi-homescreen_3.0.bbappend` | Adds `virtual/libgles2`. A software-only build still needs GLES *headers* to compile, because `flutter_desktop_texture_registrar.h` includes `<GLES2/gl2.h>` unconditionally. Headers only — nothing links GL. |
-| `recipes-flutter-apps/apps/*_%.bbappend` | Sets `S = "${WORKDIR}/git"` for third-party apps. 174 of 220 meta-flutter-apps recipes omit `S`, assuming newer oe-core aligns the git fetcher with `${WORKDIR}/${BP}`. Scarthgap unpacks to `${WORKDIR}/git`. |
-| `recipes-mchp/images/*.bb` | The local images. |
+| `recipes-flutter-apps/apps/*_%.bbappend` | Sets `S = "${WORKDIR}/git"` for 13 third-party apps. 174 of 220 meta-flutter-apps recipes omit `S`, assuming newer oe-core aligns the git fetcher with `${WORKDIR}/${BP}`. Scarthgap unpacks to `${WORKDIR}/git`. |
+| `recipes-flutter/flutter-hmi-bench/` | The scene-based render benchmark (recipe + Dart source). Produces the constraints table below. |
+| `recipes-mchp/cpufreq-performance/` | systemd unit pinning the CPU governor. The board ships `conservative`, idling at 90 MHz of an available 1000 MHz. With no GPU, clock speed *is* frame rate. |
+| `recipes-mchp/ivi-homescreen-defaults/` | `/etc/profile.d/ivi-homescreen.sh` exporting `IVI_SW_SINK=drm-dumb` (mandatory) and `IVI_SW_DRM_FORMAT=rgb565` (measured faster). |
+| `recipes-mchp/images/` | `mchp-flutter-bench-image`, `mchp-gles-probe-image`. |
 
 `BB_GIT_DEFAULT_DESTSUFFIX` would fix the `S` problem globally but is **deliberately not
 used**: it changes the unpack destination for every git recipe, breaking the many that set
 `S = "${WORKDIR}/git"` on purpose (pseudo, ivi-homescreen, dt-overlay-mchp).
+
+### Not tracked, and why
+
+- The `repo`-managed layers — pinned by manifest tag instead.
+- Build output (`build/`) — regenerable, and tens of GB.
+- `/etc/apparmor.d/bitbake` — host-local, and it hardcodes an absolute path to the BitBake
+  binary, so each developer generates their own (see [Quick start](#quick-start)).
 
 ## Troubleshooting
 
