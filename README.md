@@ -8,7 +8,7 @@ Two images are useful here:
 | Image | Contents |
 |---|---|
 | `mchp-graphics-image` | Microchip's stock EGT image. Known-good fallback. |
-| `mchp-flutter-bench-image` | Flutter (ivi-homescreen software backend) + 24 benchmark/demo apps. |
+| `mchp-flutter-bench-image` | Flutter (ivi-homescreen software backend) + 25 benchmark/demo apps. |
 | `mchp-gles-probe-image` | Mesa software-GLES probes (`glmark2`, `kmscube`). Historical baseline. |
 
 ## The hardware constraint that shapes everything
@@ -109,9 +109,6 @@ pick up template changes later, either point it at a fresh directory or copy the
 wants **80–120 GB** there; override them in your own `build/conf/local.conf` if that partition
 is small. Note oe-core appends `-glibc`, so `TMPDIR` becomes `tmp-glibc` on disk.
 
-Then in `build/conf/local.conf` set `MACHINE = "sama7d65-curiosity-sd"` and the settings
-described in [Build configuration](#build-configuration).
-
 ### 4. Build and flash
 
 ```bash
@@ -133,9 +130,14 @@ prompt.
 ## Running Flutter apps on the board
 
 ```sh
-IVI_SW_SINK=drm-dumb homescreen -b /usr/share/flutter/<app>/3.47.4/release
+homescreen -b /usr/share/flutter/<app>/3.47.4/release
 ls /usr/share/flutter/        # what is installed
 ```
+
+`IVI_SW_SINK=drm-dumb` and `IVI_SW_DRM_FORMAT=rgb565` are exported by
+`/etc/profile.d/ivi-homescreen.sh` (the `ivi-homescreen-defaults` recipe), so no environment
+setup is needed in a login shell. **A systemd launcher must set them itself** — services do
+not read `profile.d`.
 
 **`IVI_SW_SINK` is mandatory.** Without it the software backend defaults to `none` and
 silently discards every frame — a blank display with no error, only
