@@ -29,7 +29,7 @@ export IVI_SW_DRM_FORMAT=rgb565
 # --drm-no-seat because a service has no logind session for libseat to find.
 HS_ARGS="--drm-connector $CONNECTOR --drm-no-seat"
 
-log() { echo "[demo-launcher] $*"; }
+log() { echo "[demo-launcher] $*" >&2; }
 
 # Wait for the DRM device ourselves rather than ordering the unit After= a
 # dev-dri-cardN.device unit. Device units only exist for devices udev TAGs with
@@ -66,7 +66,14 @@ stop_homescreen() {
     sleep 0.4
 }
 
-run_bundle() {
+# Sets HS_PID. Deliberately NOT "HS_PID=$(run_bundle ...)": a command substitution
+# returning a PID through stdout fails twice over. The backgrounded homescreen inherits
+# the substitution's stdout pipe and holds it open, so $( ) blocks waiting for EOF for
+# the entire life of the demo - the next line, which starts the button watcher, is never
+# reached. And log() output lands in the captured text, so the "PID" is a log line with a
+# number appended and every kill -0 on it fails. Both were happening: the launcher sat
+# inside the substitution with no userbtn-wait process anywhere in its cgroup.
+start_bundle() {
     bundle=$1
     if [ ! -d "$bundle" ]; then
         log "bundle missing: $bundle"
@@ -74,7 +81,9 @@ run_bundle() {
     fi
     log "starting $bundle"
     homescreen $HS_ARGS -b "$bundle" &
-    echo $!
+    HS_PID=$!
+    log "homescreen pid $HS_PID"
+    return 0
 }
 
 trap 'log "terminating"; [ -n "${HS_PID:-}" ] && stop_homescreen "$HS_PID"; exit 0' TERM INT
@@ -84,7 +93,7 @@ wait_for_drm || exit 1
 while true; do
     rm -f "$CHOICE"
 
-    HS_PID=$(run_bundle "$MENU") || { sleep 5; continue; }
+    start_bundle "$MENU" || { sleep 5; continue; }
 
     # Wait for a selection, or for the menu to die on its own.
     while [ ! -s "$CHOICE" ] && kill -0 "$HS_PID" 2>/dev/null; do
@@ -100,7 +109,7 @@ while true; do
         continue
     fi
 
-    HS_PID=$(run_bundle "$selection") || { sleep 2; continue; }
+    start_bundle "$selection" || { sleep 2; continue; }
 
     # Block until PC10 is pressed. If the demo dies first, fall through to the menu.
     userbtn-wait &
