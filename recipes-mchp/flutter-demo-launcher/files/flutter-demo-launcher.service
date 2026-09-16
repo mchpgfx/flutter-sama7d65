@@ -1,0 +1,26 @@
+[Unit]
+Description=Flutter demo launcher (menu + demo selection)
+# The DRM device must exist before the software sink can open it; waiting on the
+# device unit avoids a startup race that presents as an intermittent blank screen.
+Wants=dev-dri-card0.device
+After=dev-dri-card0.device systemd-udev-settle.service
+# The governor unit pins 1 GHz; the board otherwise idles at 90 MHz and the first
+# frames would render at a fraction of full clock.
+After=cpufreq-performance.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/flutter-demo-launcher
+# Override the pinned connector without editing the script, e.g. for a DSI panel.
+# Environment=DEMO_CONNECTOR=DSI-1
+Restart=always
+RestartSec=2s
+# The script manages its own child processes; kill the whole group on stop so a
+# homescreen instance cannot outlive the supervisor and keep DRM master.
+KillMode=control-group
+TimeoutStopSec=15s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

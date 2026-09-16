@@ -1,0 +1,100 @@
+#!/bin/sh
+# Menu -> demo -> USER button -> menu, forever.
+#
+# ivi-homescreen runs ONE bundle per process and holds DRM master while it does, so
+# switching demos means terminating one process and starting another. That is the
+# whole reason this script exists rather than in-app navigation.
+#
+# Flow:
+#   1. run the menu bundle
+#   2. the menu writes the chosen bundle path to $CHOICE and exits
+#   3. run that bundle
+#   4. userbtn-wait blocks until PC10 (KEY_0 via gpio-keys) is pressed
+#   5. terminate the demo, loop
+set -u
+
+CHOICE=/run/demo-choice
+MENU=/usr/share/flutter/flutter_demo_menu/3.47.4/release
+CONNECTOR="${DEMO_CONNECTOR:-LVDS-1}"
+
+# Set here, not inherited: systemd services do not read /etc/profile.d, and without
+# IVI_SW_SINK the software backend discards every frame silently.
+export IVI_SW_SINK=drm-dumb
+export IVI_SW_DRM_FORMAT=rgb565
+# IVI_SW_VSYNC is deliberately NOT set. Disabling vsync tears by design.
+
+# --drm-connector is pinned because LVDS has no hotplug detect: every LVDS connector
+# reports "connected" whether a panel is fitted or not, and this board exposes two
+# against a single encoder/CRTC. Unpinned, selection is kernel enumeration order.
+# --drm-no-seat because a service has no logind session for libseat to find.
+HS_ARGS="--drm-connector $CONNECTOR --drm-no-seat"
+
+log() { echo "[demo-launcher] $*"; }
+
+# SIGTERM, then SIGKILL if it will not go. Waiting matters: homescreen restores the
+# CRTC on exit, and starting the next instance before DRM master is released fails.
+stop_homescreen() {
+    pid=$1
+    kill -TERM "$pid" 2>/dev/null || return 0
+    i=0
+    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+        sleep 0.1; i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        log "pid $pid ignored SIGTERM, sending SIGKILL"
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    wait "$pid" 2>/dev/null
+    # Let the kernel drop DRM master before the next acquire.
+    sleep 0.4
+}
+
+run_bundle() {
+    bundle=$1
+    if [ ! -d "$bundle" ]; then
+        log "bundle missing: $bundle"
+        return 1
+    fi
+    log "starting $bundle"
+    homescreen $HS_ARGS -b "$bundle" &
+    echo $!
+}
+
+trap 'log "terminating"; [ -n "${HS_PID:-}" ] && stop_homescreen "$HS_PID"; exit 0' TERM INT
+
+while true; do
+    rm -f "$CHOICE"
+
+    HS_PID=$(run_bundle "$MENU") || { sleep 5; continue; }
+
+    # Wait for a selection, or for the menu to die on its own.
+    while [ ! -s "$CHOICE" ] && kill -0 "$HS_PID" 2>/dev/null; do
+        sleep 0.2
+    done
+
+    selection=""
+    [ -s "$CHOICE" ] && selection=$(head -n1 "$CHOICE")
+    stop_homescreen "$HS_PID"; HS_PID=""
+
+    if [ -z "$selection" ]; then
+        log "menu exited without a selection; restarting it"
+        continue
+    fi
+
+    HS_PID=$(run_bundle "$selection") || { sleep 2; continue; }
+
+    # Block until PC10 is pressed. If the demo dies first, fall through to the menu.
+    userbtn-wait &
+    BTN_PID=$!
+    while kill -0 "$BTN_PID" 2>/dev/null && kill -0 "$HS_PID" 2>/dev/null; do
+        sleep 0.2
+    done
+    if kill -0 "$BTN_PID" 2>/dev/null; then
+        log "demo exited on its own; returning to menu"
+        kill -TERM "$BTN_PID" 2>/dev/null; wait "$BTN_PID" 2>/dev/null
+    else
+        log "USER button pressed; returning to menu"
+    fi
+
+    stop_homescreen "$HS_PID"; HS_PID=""
+done

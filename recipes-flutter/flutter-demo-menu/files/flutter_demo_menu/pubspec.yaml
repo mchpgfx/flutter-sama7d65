@@ -1,0 +1,16 @@
+name: flutter_demo_menu
+description: Demo selector for the SAMA7D65 Curiosity 800x480 panel.
+publish_to: none
+version: 1.0.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+# No third-party packages: anything pulling a Linux plugin cannot build here,
+# since the software backend requires disable-plugins.
+dependencies:
+  flutter:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
