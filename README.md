@@ -41,6 +41,10 @@ stacked translucency are 2–15× over and must be designed out. See
 [Troubleshooting](#troubleshooting): pin `--drm-connector` explicitly, and never ship
 `IVI_SW_VSYNC=0`.
 
+**`mchp-flutter-gallery-image` boots straight to a demo menu** (Flutter Gallery or the
+Material 3 demo; the USER button on PC10 returns to the menu). It is **panel-size
+agnostic** — see [One image, any panel size](#one-image-any-panel-size).
+
 ## Quick start
 
 ### 1. Host prerequisites (Ubuntu 24.04)
@@ -241,6 +245,124 @@ for the derivation. Three reasons it is not worth building:
 
 None of it touches the flip wait, which is the larger part of the per-frame floor and is the
 display pacing the renderer, not work.
+
+## One image, any panel size
+
+Nothing in the rootfs is tied to 800x480. The resolution comes from the mode the kernel
+sets, and every layer above it follows:
+
+| Layer | How it learns the size |
+|---|---|
+| `atmel-hlcdc` XLCDC | Panel timings from the DT overlay. Controller limit is **2048x2048** (`atmel_hlcdc_dc.c`, `atmel_xlcdc_dc_sama7d65`), so 1280x800 is well inside it |
+| `ivi-homescreen` software sink | Adopts the connector's current mode; `-w`/`--height` are unnecessary |
+| Flutter engine | Told the view size by the embedder |
+| Demo apps + menu | Lay out from `MediaQuery` / `View.of(context)` |
+
+**Switching panels is a bootargs/overlay change, not an image change.** U-Boot detects the
+panel and selects the overlay that carries its timings; on the fitted ST7262 it appends
+`video=Unknown-1:800x480-16`. Point it at a different panel and the whole stack follows.
+
+**The menu reports what it actually found**, so the panel is self-evident on screen:
+
+```
+Skia CPU · 1280x800 @ 60.0 Hz · NEON+VFPv4 · no GPU
+```
+
+Resolution and refresh rate come from `View.of(context).physicalSize` and
+`Display.refreshRate`; the SIMD field is parsed from `/proc/cpuinfo` `Features`. An earlier
+version hardcoded the string `800x480`, which would have gone on claiming 800x480 on a
+1280x800 panel — a display readout that cannot be wrong is worth the ten lines.
+
+`test/menu_layout_test.dart` asserts no overflow at 480x272, 800x480, 1024x600, 1280x800,
+2048x2048 and two portrait sizes. Run it on the host:
+
+```sh
+SDK=$(dirname $(find ~/yocto-build/tmp-glibc -path '*/flutter/sdk/bin/flutter' | head -1))
+cd meta-local/recipes-flutter/flutter-demo-menu/files/flutter_demo_menu
+PATH="$SDK:$PATH" PUB_CACHE="$(dirname $SDK)/.pub-cache" flutter pub get --offline
+PATH="$SDK:$PATH" PUB_CACHE="$(dirname $SDK)/.pub-cache" flutter test
+```
+
+That test earned its keep immediately: the menu stacked its two tiles when *width* was
+small, which is backwards — stacking doubles the height needed, so a short landscape panel
+(480x272) overflowed. It now stacks only when the panel is portrait.
+
+### The cost, which does not scale for free
+
+**A bigger panel is proportionally more work for the CPU**, because the CPU draws every
+pixel. 1280x800 is **2.67x** the pixels of 800x480, and fill-rate-bound work scales with
+that ratio while the per-refresh budget does not:
+
+| Scene (measured at 800x480) | 800x480 (19.0 ms budget) | Projected at 1280x800 (18.4 ms budget) |
+|---|---|---|
+| Full-screen fill | 8.8 ms | ~23 ms — **over budget** |
+| Progress bars | 6.2 ms | ~17 ms — marginal |
+| Big digits | 7.7 ms | ~21 ms — **over** |
+| List scroll | 11–15 ms | ~29–40 ms — **well over** |
+
+Those projections are arithmetic on the pixel-count ratio, **not measurements** — text and
+path rasterisation scale with glyph and path area rather than screen area, so treat them as
+an upper bound and re-run `flutter-hmi-bench` on the actual panel before committing to a
+design. The direction is not in doubt, though: **the constraints table in
+[GUI design constraints](#gui-design-constraints-measured) is specific to 800x480 and gets
+tighter on a larger panel.** Budget headroom is the thing a bigger display spends.
+
+A larger panel also raises the refresh period question again: the budget is one refresh, so
+measure the new mode's rate rather than assuming 52.64 Hz or 60 Hz.
+
+### The New Vision 10.1" panel: already in the FIT, but not auto-detected
+
+`sama7d65_curiosity.itb` ships an overlay for it. Read straight out of the built FIT rather
+than a datasheet:
+
+| | |
+|---|---|
+| FIT configuration name | **`lvds_newvision`** (siblings: `lvds`, `mipi`) |
+| Resolution | **1280x800** |
+| Pixel clock | 65 MHz |
+| Blanking | h: sync 32, front 48, back 80 · v: sync 8, front 8, back 16 |
+| Panel size | 216 x 135 mm (10.1") |
+| Refresh | 65e6 / (1440 x 832) = **~54.2 Hz → an 18.4 ms budget** |
+| Touch | included — the overlay carries `atmel,maxtouch` |
+
+So the budget barely moves (19.0 → 18.4 ms) while the pixel count goes up 2.67x. That is the
+whole story of this panel change in one line.
+
+**U-Boot will not select it for you.** The env has exactly two detection tests:
+
+```
+lvdstest=test -n $display && test $display = ST7262 && setenv display_var 'lvds' && ...
+mipitest=test -n $display && test $display = HX8394 && setenv display_var 'mipi' && ...
+```
+
+Neither matches the New Vision panel, so `display_var` stays empty, no display overlay is
+appended and no `video=` bootarg is set. It has to be selected explicitly — something like:
+
+```sh
+setenv video_mode_nvd 'Unknown-1:1280x800-16'
+setenv nvdtest 'setenv display_var lvds_newvision; setenv at91_video_bootargs video=${video_mode_nvd}'
+setenv at91_display_detect 'run lvdstest; run mipitest; run nvdtest; run at91_prepare_bootargs; run at91_prepare_display_overlay'
+saveenv
+```
+
+Order matters: `nvdtest` must run before `at91_prepare_bootargs` and
+`at91_prepare_display_overlay`, and it unconditionally overrides — so remove it before going
+back to the ST7262 panel, or gate it on whatever `$display` reports for this one. **This env
+snippet is derived from reading the env file, not tested on hardware.** Confirm with
+`modetest -c` (mode should read 1280x800) and the menu's own status line.
+
+### If the new panel lands on a different connector
+
+`flutter-demo-launcher` pins `--drm-connector LVDS-1`, deliberately (LVDS has no hotplug
+detect, so every LVDS connector claims to be connected). A panel on another connector needs
+that pin changed — no rebuild required:
+
+```sh
+systemctl edit flutter-demo-launcher    # [Service] / Environment=DEMO_CONNECTOR=DSI-1
+```
+
+`modetest -c` lists connectors with their encoder and CRTC bindings; pick the one with a
+**non-zero encoder**, not merely `connected`.
 
 ## Build configuration
 
@@ -601,8 +723,9 @@ embedder patch to `poll()` the DRM fd would remove both.
   process, not the unit file. The sink's flip watchdog is a weaker explanation than first
   thought: its deadline is 5 refresh periods (~95 ms), so ordinary scroll load should not trip
   it. See [Troubleshooting](#troubleshooting).
-- **`--drm-connector` pinning is documented but not yet applied in the launcher.** Until it is,
-  each unit picks its connector by kernel enumeration order and can bind an undrivable output.
+- **Panel-size projections are arithmetic, not measured.** The 1280x800 column in
+  [One image, any panel size](#one-image-any-panel-size) scales the 800x480 numbers by pixel
+  count. Re-run `flutter-hmi-bench` on any new panel before trusting it.
 - **No on-screen keyboard exists in this stack.** `TextField` asks the embedder for one and the
   software backend provides none; with `disable-plugins` the platform channel is not compiled in
   either. Draw a keypad in Dart with `readOnly: true` on the field, or design around text entry.

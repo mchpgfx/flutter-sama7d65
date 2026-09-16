@@ -1,5 +1,5 @@
 name: flutter_demo_menu
-description: Demo selector for the SAMA7D65 Curiosity 800x480 panel.
+description: Demo selector for the SAMA7D65 Curiosity. Panel-size agnostic.
 publish_to: none
 version: 1.0.0
 
@@ -14,3 +14,11 @@ dependencies:
 
 flutter:
   uses-material-design: true
+
+# flutter_test comes from the SDK, so this needs no network and does not enter the
+# release build. test/menu_layout_test.dart asserts the menu renders without overflow
+# from 480x272 to 2048x2048 and that the status line reports the LIVE resolution -
+# that test is what caught the stacking rule being keyed off the wrong axis.
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

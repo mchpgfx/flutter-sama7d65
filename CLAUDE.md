@@ -264,6 +264,48 @@ not the unit file: `tr '\0' '\n' < /proc/$(pgrep -x homescreen)/environ | grep ^
 is unset and tearing persists, grep for `force-clearing flip_pending_` — the watchdog
 submitting a flip mid-scanout because the completion event was not serviced in time.
 
+### One image, any panel size — and the readout must be live
+
+Nothing in the rootfs is tied to 800x480. XLCDC allows **2048x2048**
+(`atmel_hlcdc_dc.c`, `atmel_xlcdc_dc_sama7d65`), the software sink adopts the connector's
+current mode, and Flutter lays out from the view size. **Switching panels is a
+bootargs/overlay change, not an image change** — U-Boot picks the overlay carrying the
+timings.
+
+**Never hardcode the resolution in UI text.** The menu did (`'… · 800×480 · …'`) and would
+have kept claiming 800x480 on a 1280x800 panel. It now reads
+`View.of(context).physicalSize`, `Display.refreshRate` (wrapped in try/catch — it resolves
+through a nullable map on the platform dispatcher and the software embedder may register no
+Display, so the resolution must not depend on it), and `/proc/cpuinfo` `Features` for
+NEON/VFPv4. On x86 that field reads `NEON unknown`, which is correct: x86 cpuinfo has no
+`Features` line, it uses `flags`.
+
+**Two Dart gotchas hit here:** `num.clamp()` returns **`num`**, so `.toDouble()` is required
+before the value reaches a `double` parameter; and in a `cond ? 0 : 18 * s` the int literal
+should be written `0.0`.
+
+**`test/menu_layout_test.dart` is the regression guard** — no overflow from 480x272 to
+2048x2048 plus two portrait sizes, and the status line must contain the live resolution. It
+immediately caught a real design error: stacking the tiles when *width* was small is
+backwards, because stacking doubles the height needed and a short landscape panel then
+overflows. Stack on **portrait aspect**, not narrow width. Run it with the SDK from the
+sysroot and `PUB_CACHE` pointed at the SDK's own `.pub-cache` (`--offline` works); see
+README.
+
+**The New Vision 10.1" panel is already in the FIT as config `lvds_newvision`** —
+1280x800, 65 MHz pixel clock, h-blank 32/48/80, v-blank 8/8/16, 216x135 mm, and it carries
+`atmel,maxtouch` so touch comes with it. Refresh is 65e6/(1440x832) = **~54.2 Hz, an 18.4 ms
+budget** (read out of the built `.itb`, not a datasheet). **U-Boot will not select it:** the
+env tests only `ST7262` -> `lvds` and `HX8394` -> `mipi`, so `display_var` stays empty and
+neither the overlay nor a `video=` bootarg is applied. It must be set explicitly; README has
+an env snippet, marked as derived from the env file rather than tested.
+
+**A bigger panel costs proportionally more CPU.** 1280x800 is **2.67x** the pixels of
+800x480 and the per-refresh budget does not grow, so the measured constraints table is
+specific to 800x480 and tightens on anything larger. The projected numbers in the README are
+arithmetic on pixel count, **not measurements** — re-run `flutter-hmi-bench` on the new
+panel.
+
 ### The auto-start kiosk path: what actually broke (and one wrong diagnosis)
 
 **The real bug was `HS_PID=$(run_bundle ...)` in the launcher.** Returning a background
