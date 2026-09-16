@@ -188,9 +188,11 @@ where the fonts and xkb data came from.
 
 Other `local.conf` settings: `DISTRO_FEATURES:append = " opengl"` (needed *only* because
 `flutter-engine` has `REQUIRED_DISTRO_FEATURES = "opengl"`; it depends on no GL
-implementation); `PACKAGECONFIG:pn-flutter-engine` = **`release` only** (the recipe default
-`debug profile release` is three complete engine builds); no engine `lto` yet — revisit only
-if measurements land near the 33 ms budget.
+implementation); `PACKAGECONFIG:pn-flutter-engine` = the recipe's own default set **minus
+`debug` and `profile`** (the default `debug profile release` is three complete engine builds),
+**plus `lto`**, enabled 2026-09-15 — worth the build time, but the workload is fill-rate bound
+so expect single-digit to low-double-digit percent, not a transformation. `lto` is also on for
+`ivi-homescreen`, where it is cheap. Never add `slimpeller`: it strips Skia.
 
 **The pattern across all of this: the software backend is untrodden upstream.** Every
 failure so far has been code assuming an EGL backend exists. Expect more of the same, and
