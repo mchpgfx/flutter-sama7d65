@@ -469,23 +469,8 @@ scene. It runs first; treat it as a warm-up artefact, not data.
 
 ### Design rules
 
-1. **`RepaintBoundary` around anything animated.** Measured **11.7 ms versus 21.2 ms** for
-   identical needle drawing - 1.8x, and the difference between fitting a refresh and missing it.
-   Cost tracks pixels touched, so keep animated regions physically small.
-2. **Never scale images at runtime.** 1:1 is 8.1 ms; 1.7x is 72-103 ms. Pre-size every asset to
-   its exact on-screen pixels; cap decode with `cacheWidth`/`cacheHeight`; use
-   `FilterQuality.none`. The 2D GPU cannot help - `M2D_CAP_STRETCHED_BLIT` is unimplemented.
-3. **No full-screen gradients** (256 ms). Use flat fills or a small pre-rendered gradient
-   bitmap drawn 1:1.
-4. **No stacked translucency** (280 ms). Composite opacity into flat opaque colours at design
-   time.
-5. **No blur** (180 ms) and **no `BoxShadow`** (43 ms). Borders or flat colour steps instead.
-6. **Charts need a budget.** 141 ms unpaced / 46 ms in situ for 3 x 267 points. Decimate to at
-   most one point per horizontal pixel, cache static grid and axes behind a `RepaintBoundary`,
-   prefer 1 px non-antialiased strokes.
-7. **Everything a conventional instrument UI needs is comfortably affordable**: text, large
-   digits, value readouts, progress bars, switches, lists, 1:1 images, and bounded animated
-   gauges - all 6-12 ms against a 19.0 ms budget.
+See [Optimisation guidelines](#optimisation-guidelines) below for the consolidated list, ordered
+by measured value.
 
 ### Why the 2D GPU is not used, despite being enabled
 
@@ -503,6 +488,124 @@ was **slower than the display path** (charts 46 -> 151 ms) with `buildDuration` 
 If offloading is ever revisited, the **display controller's two overlay planes** (with `alpha`
 and `rotation`, plus YUV on plane 39) are the better target - hardware compositing at scanout,
 no GPU, no libm2d, no cache maintenance, no patched embedder.
+
+## Optimisation guidelines
+
+Ordered by measured or expected value. Everything in Tier 1 is under your control in Dart and
+needs no change to the stack.
+
+### The one number to design against
+
+**19.0 ms of build + raster per frame.** The panel is 52.64 Hz and the sink waits for the
+previous page flip, so frame rate steps — 52.6 / 26.3 / 17.5 fps. Twenty milliseconds of work
+gives you 26 fps, not 50. There is no partial credit for being slightly over.
+
+### Tier 1 — Dart and widget design (largest wins)
+
+**Wrap everything animated in `RepaintBoundary`.** Measured **11.7 ms versus 21.2 ms** for
+identical needle drawing — 1.8×, and the difference between making a refresh and missing it.
+Cost tracks pixels touched rather than scene complexity, so also keep animated regions
+physically small: a needle in a 120×120 box is affordable, the same needle repainting 800×480 is
+not.
+
+**Never scale an image at runtime.** 1:1 costs 8.1 ms; 1.7× costs 72–103 ms. Resize every asset
+to its exact on-screen pixel size **at build time** and use `FilterQuality.none`. If a decode
+must yield something larger, cap it with `cacheWidth`/`cacheHeight` so Skia never holds or
+resamples the full-size bitmap. The 2D GPU cannot help here — `M2D_CAP_STRETCHED_BLIT` is
+unimplemented in libm2d.
+
+**Avoid everything that forces `saveLayer`**, which allocates an offscreen buffer and composites
+it:
+
+| Instead of | Use |
+|---|---|
+| `Opacity` / `AnimatedOpacity` over a busy subtree | Cross-tween two **opaque** colours |
+| `ClipRRect` with `Clip.antiAliasWithSaveLayer` (50 ms) | Pre-render rounded corners into the opaque background |
+| `BoxShadow` / Material elevation (43 ms) | A 1 px border, a rule, or a flat colour step |
+| `BackdropFilter` blur (180 ms) | Nothing — remove it from the design |
+| Stacked translucent layers (280 ms) | Flatten the alpha into opaque colours at design time |
+| Full-screen `LinearGradient` (256 ms) | Flat fill, or a small pre-rendered gradient bitmap drawn 1:1 |
+
+**Charts need deliberate construction** — 141 ms for 3 × 267 antialiased 2 px polylines. Note
+that decimation alone will *not* save you: 267 points across 800 px is already under one point
+per pixel, so the cost is antialiasing and stroke geometry, not point count.
+
+- `isAntiAlias: false` and `strokeWidth: 1`
+- `drawRawPoints` with `PointMode.polygon` rather than building a `Path`
+- Grid, axes and labels in their own `RepaintBoundary` so only the trace repaints
+- Fewer series, or update the trace at a lower rate than the rest of the UI
+
+**Keep the build phase allocation-free.** `const` constructors, static subtrees hoisted out of
+`build()`, `AnimatedBuilder` scoped to the smallest leaf that changes. Per-frame allocation means
+Dart GC, and on a single core a GC pause is a missed refresh.
+
+**Make backgrounds opaque**, so Skia can skip blending entirely and stacked containers do not
+cause overdraw.
+
+**What is comfortably affordable**, for reference: text, large digits, value readouts, progress
+bars, switches, lists, 1:1 images and `RepaintBoundary`-bounded animated gauges all measure
+6–12 ms against the 19.0 ms budget.
+
+### Tier 2 — system configuration
+
+Everything else on the board competes for the one core.
+
+- `systemd-analyze blame`, then disable what a fielded instrument does not need.
+- Reduce journald volume — per-frame logging costs CPU and SD I/O.
+- Preload assets at startup so nothing touches the SD card while rendering.
+- Check for thermal throttling under sustained load now that the governor is pinned:
+  `cat /sys/class/thermal/thermal_zone*/temp` during a scroll.
+- Reclaim `cma=192m` in bootargs if the display does not need all of it — on a 1 GB system that
+  is page cache you are not getting.
+- Governor must be `performance` (the `cpufreq-performance` unit sets this); the board ships
+  `conservative`, which idles at 90 MHz of an available 1000.
+- `IVI_SW_DRM_FORMAT=rgb565` to match the panel's 16 bpp — measured faster, set by
+  `ivi-homescreen-defaults`.
+
+### Tier 3 — a deliberate trade worth considering
+
+**Target 26 fps instead of 52.6.** Because frame rate is quantised, aiming at the second step
+roughly halves rendering CPU and leaves the core free for control logic and bus traffic. For an
+instrument panel that is often the right trade, and it changes how you pace animations rather
+than anything in the stack.
+
+### Tier 4 — investigations, if the above is not enough
+
+**Build a `profile`-mode engine** (a `PACKAGECONFIG` addition plus one engine build) and use
+DevTools' timeline. That gives per-primitive raster breakdowns instead of scene-level numbers,
+and is the principled way to attack the chart cost rather than guessing.
+
+**Establish whether the XLCDC can upscale.** If it can, rendering at 400×240 quarters the pixels
+— potentially 4× on every fill-rate-bound scene, which is most of the over-budget list. **Not
+verified:** the `modetest` output shows no scaling property on the planes, so it may not exist.
+High ceiling, and cheap to rule in or out from the driver source.
+
+**The flip wait polls at 500 µs** (`sleep_for(500us)`) rather than blocking on the DRM fd. It
+does release the core, so this is minor — roughly 38 timer wakeups per frame and up to 500 µs of
+latency detecting flip completion, which can occasionally push a frame past a boundary. An
+embedder patch to `poll()` the DRM fd would remove both.
+
+### Settled — do not revisit
+
+| Idea | Why not |
+|---|---|
+| libm2d / 2D GPU offload of the present blit | The swizzle is only 2–4 ms. Needs the compositor API, embedder-allocated backing stores and ~1.5 MB/frame of cache maintenance on a non-coherent GPU — plausibly costing what it saves — and does not touch the flip wait |
+| Software OpenGL ES (llvmpipe / softpipe) | llvmpipe segfaults on armv7; softpipe scores `glmark2 Score: 1` |
+| `-O3` or other compiler flags | Already `-O2` + LTO + NEON + `-mcpu=cortex-a7`. The hot paths are Skia's hand-written NEON intrinsics and memory traffic; `-O3` risks hurting via I-cache pressure on a 32 KB L1 |
+| Hardware line drawing for charts | `M2D_CAP_DRAW_LINES` is unimplemented in libm2d, and Skia would not call it in any case |
+
+## Open items
+
+- **Tearing during scroll (field report), unresolved.** Leading candidate is `IVI_SW_VSYNC=0`
+  reaching production — it is a measurement tool and tears by design. Check the *running*
+  process, not the unit file. The sink's flip watchdog is a weaker explanation than first
+  thought: its deadline is 5 refresh periods (~95 ms), so ordinary scroll load should not trip
+  it. See [Troubleshooting](#troubleshooting).
+- **`--drm-connector` pinning is documented but not yet applied in the launcher.** Until it is,
+  each unit picks its connector by kernel enumeration order and can bind an undrivable output.
+- **No on-screen keyboard exists in this stack.** `TextField` asks the embedder for one and the
+  software backend provides none; with `disable-plugins` the platform channel is not compiled in
+  either. Draw a keypad in Dart with `readOnly: true` on the field, or design around text entry.
 
 ## Reference
 
