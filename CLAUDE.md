@@ -66,8 +66,10 @@ false "success" here.
 The **800×480 LVDS panel already works** — no BSP/DT work needed. The board DTS has no
 display nodes; U-Boot auto-detects the panel and on an **ST7262** selects the `lvds` overlay
 from `sama7d65_curiosity.itb`, appending `video=Unknown-1:800x480-16` (16 bpp) to bootargs.
-Timings live in the overlay, driven by `CONFIG_DRM_PANEL_LVDS`. Leave `dt-overlay-mchp`,
-`bootargs` and `bootcmd` alone.
+Timings live in the overlay, driven by `CONFIG_DRM_PANEL_LVDS`. For the fitted panel, leave
+`dt-overlay-mchp`, `bootargs` and `bootcmd` alone — but note that **switching** panels is
+exactly a `bootargs`/overlay change, and only `ST7262` and `HX8394` are auto-detected. See
+"One image, any panel size" below.
 
 Note `cma=192m` is reserved in bootargs, off 1 GB total.
 
@@ -368,7 +370,13 @@ is running — it blocks on the server lock.
 
 Images: `mchp-graphics-image` (EGT, known-good fallback), `mchp-headless-image`,
 `mchp-gles-probe-image` (local, softpipe GLES baseline), `mchp-flutter-bench-image` (local,
-Flutter + software backend + benchmark apps).
+Flutter + software backend + benchmark apps), **`mchp-flutter-gallery-image`** (local, boots
+to the demo menu; despite the name it is no longer gallery-specific).
+
+**Scripting a build needs bash and no `set -u`.** `oe-init-build-env` is not dash-compatible
+(`source: not found`) and reads unset variables (`BBSERVER: unbound variable`), so a wrapper
+using `sh` or `set -u` exits before bitbake ever runs — and does so with a status that can
+look like success. Both happened here; only the `^ERROR`-count-plus-`rc=` check caught it.
 
 Flashing needs root, which the agent session cannot do. Unmount first as a **separate**
 command — a failed `umount` in a `&&` chain silently skips the write:

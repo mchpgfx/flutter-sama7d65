@@ -446,7 +446,10 @@ reverted by `repo sync`, so anything patched there would silently disappear.
 | `recipes-flutter/flutter-hmi-bench/` | The scene-based render benchmark (recipe + Dart source). Produces the constraints table below. |
 | `recipes-mchp/cpufreq-performance/` | systemd unit pinning the CPU governor. The board ships `conservative`, idling at 90 MHz of an available 1000 MHz. With no GPU, clock speed *is* frame rate. |
 | `recipes-mchp/ivi-homescreen-defaults/` | `/etc/profile.d/ivi-homescreen.sh` exporting `IVI_SW_SINK=drm-dumb` (mandatory) and `IVI_SW_DRM_FORMAT=rgb565` (measured faster). |
-| `recipes-mchp/images/` | `mchp-flutter-bench-image`, `mchp-gles-probe-image`. |
+| `recipes-flutter/flutter-demo-menu/` | The demo selector shown at boot: recipe, Dart source, and `test/menu_layout_test.dart`. Writes the chosen bundle path to `/run/demo-choice` and exits; reports resolution, refresh rate and NEON live. |
+| `recipes-mchp/userbtn-wait/` | Blocks until the USER button (PC10) is pressed, then exits 0. Finds its input device by **capability** (`EVIOCGBIT`, test `KEY_0`), not by name. Exits 2 for "no device" and 3 for a read error so a setup failure cannot be mistaken for a press. |
+| `recipes-mchp/flutter-demo-launcher/` | The supervisor and its systemd unit: menu → demo → button → menu, forever. Exports `IVI_SW_SINK`/`IVI_SW_DRM_FORMAT` itself (services do not read `/etc/profile.d`) and pins `--drm-connector`. |
+| `recipes-mchp/images/` | `mchp-flutter-gallery-image` (boots to the demo menu), `mchp-flutter-bench-image`, `mchp-gles-probe-image`. |
 
 `BB_GIT_DEFAULT_DESTSUFFIX` would fix the `S` problem globally but is **deliberately not
 used**: it changes the unpack destination for every git recipe, breaking the many that set
@@ -486,6 +489,41 @@ wrapper script exiting 0 around a failed build has caused a false "success"), an
 unwanted runtime linkage, the image manifest for packages that were the point.
 
 Also: task counts are not duration. One task can be an entire LLVM or Flutter-engine build.
+
+### The demo launcher: three failure modes worth recognising
+
+**Nothing on screen and no `homescreen` process, but the unit is `enabled`.** Check whether
+the unit is *waiting* on something: `systemctl list-jobs`. Do **not** order a unit `After=` or
+`Wants=` a `dev-dri-cardN.device` unit — device units exist only for devices udev tags
+`TAG+="systemd"`, and this image's `99-systemd.rules` tags `tty`, `block`, `net`, `sound`,
+`usb`, `ubi`, `ptp`, `bluetooth`, `udc`, `rfkill` and **nothing in the `drm` subsystem**, so
+`dev-dri-card0.device` can never activate. `flutter-demo-launcher` polls for `/dev/dri/card*`
+itself.
+
+**The demo runs but the USER button does nothing.** Look at the service cgroup:
+
+```sh
+systemctl status flutter-demo-launcher --no-pager     # shows the cgroup tree
+```
+
+If `userbtn-wait` is **absent** from the cgroup, the supervisor never started it — it is not a
+button problem. The cause here was `HS_PID=$(run_bundle …)`: a backgrounded child inherits the
+command substitution's stdout pipe and holds it open, so `$( )` blocks for the demo's entire
+lifetime and the next line never runs. Never return a PID through `$( )`; start the child in
+the caller's shell and read `$!`.
+
+If `userbtn-wait` **is** running, check what it picked — it logs every candidate device with a
+`KEY_0=yes/no` verdict. Confirm the button independently:
+
+```sh
+cat /proc/bus/input/devices     # expect N: Name="gpio-keys", B: KEY=800  (bit 11 = KEY_0)
+journalctl -u flutter-demo-launcher | grep KeyCallback   # keysym 48 = ASCII '0'
+```
+
+Note the button reaches Flutter as a `'0'` keypress too, because evdev delivers to every
+reader. Harmless in these demos, but a focused `TextField` in a real HMI would receive a zero.
+
+**A blank screen on some units only.** See the connector note above: pin `--drm-connector`.
 
 ## Known limitations
 
@@ -739,10 +777,16 @@ embedder patch to `poll()` the DRM fd would remove both.
 - meta-clang: <https://github.com/kraj/meta-clang> (branch `scarthgap`)
 - ivi-homescreen: <https://github.com/toyota-connected/ivi-homescreen> (branch `v3.0`)
 
-The display needs no work: the board DTS has no display nodes, and U-Boot auto-detects the
-panel — on an ST7262 it selects the `lvds` overlay from `sama7d65_curiosity.itb` and appends
-`video=Unknown-1:800x480-16` to bootargs, with timings carried in the overlay and driven by
-`CONFIG_DRM_PANEL_LVDS`. Leave `dt-overlay-mchp`, `bootargs` and `bootcmd` alone.
+The fitted display needs no work: the board DTS has no display nodes, and U-Boot auto-detects
+the panel — on an ST7262 it selects the `lvds` overlay from `sama7d65_curiosity.itb` and
+appends `video=Unknown-1:800x480-16` to bootargs, with timings carried in the overlay and
+driven by `CONFIG_DRM_PANEL_LVDS`. For the panel that is fitted, leave `dt-overlay-mchp`,
+`bootargs` and `bootcmd` alone.
+
+**Changing panels is the exception**, and it is a U-Boot change rather than an image or layer
+change: only `ST7262` and `HX8394` are auto-detected, so any other panel must have its overlay
+and `video=` mode selected explicitly. See
+[One image, any panel size](#one-image-any-panel-size).
 
 `CLAUDE.md` in this directory holds the same operational knowledge in a terser form, aimed at
 AI coding agents rather than people.
