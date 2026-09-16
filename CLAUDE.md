@@ -18,6 +18,17 @@ Build artefacts are redirected because this directory's partition had only ~73 G
 `/` has ~440 GB. oe-core appends `-glibc` to `TMPDIR` via `TCLIBCAPPEND`, so the configured
 `TMPDIR` of `~/yocto-build/tmp` becomes **`tmp-glibc`** on disk.
 
+## Version control
+
+**`meta-local` is a git repo of its own** — remote `origin`
+`ssh://git@bitbucket.microchip.com/mg/flutter.git`, branch `master`, tracking
+`origin/master`. Nothing else in this workspace is tracked here (the `repo`-managed layers are
+pinned by manifest tag; `build/` is regenerable and tens of GB).
+
+History goes **straight to `master`**; there is no PR flow in use, though Bitbucket offers one
+on push. Commit inside `meta-local`, not from the workspace root — the workspace root is not a
+git repository.
+
 ## Layers
 
 Manifest-managed (**`repo sync` reverts any edit** — never patch these):
@@ -99,6 +110,11 @@ software rendering); the CHANGELOG is authoritative.
 `mchp-flutter-bench-image` (463 MB). `readelf -d /usr/bin/homescreen` confirms **no
 libGLESv2/libEGL/libgbm/Wayland linkage**, only `libdrm.so.2`. `scroll-bench` renders on the
 800×480 panel.
+
+**`mchp-flutter-gallery-image` confirmed on hardware 2026-09-16** (537 MB) — user-verified
+end to end: boots to the demo menu unattended, both demos launch, and the USER button returns
+to the menu. That took four bugs to get there; see
+"The auto-start kiosk path" below before touching the launcher, the unit or `userbtn-wait`.
 
 ### Running it: the sink MUST be set in the environment
 
@@ -346,8 +362,11 @@ it found no device and the launcher treated *any* exit as a press, so a broken b
 have ejected the user from every demo. Now `0` = pressed, `2` = no device, `3` = read error,
 and only `0` returns to the menu.
 
-**Unresolved: why the unit did not start on the first image.** It is `enabled` and now runs
-(`active (running)`, `No jobs running`). I removed a `Wants=`/`After=dev-dri-card0.device`
+**Confirmed working end to end on 2026-09-16** — unattended boot to menu, both demos, and
+the button returning to the menu. Everything below is the record of how, not an open problem.
+
+**Still unresolved: why the unit did not start on the *first* image.** It is `enabled` and now
+runs (`active (running)`, `No jobs running`). I removed a `Wants=`/`After=dev-dri-card0.device`
 dependency on the theory that it blocked startup, and that dependency *is* genuinely unsound —
 `99-systemd.rules` in this image tags `tty`, `block`, `net`, `sound`, `usb`, `ubi`, `ptp`,
 `bluetooth`, `udc`, `rfkill` and **nothing in the `drm` subsystem**, so `dev-dri-card0.device`
