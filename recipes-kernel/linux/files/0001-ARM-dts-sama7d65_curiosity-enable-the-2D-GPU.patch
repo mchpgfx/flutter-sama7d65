@@ -1,0 +1,37 @@
+From: meta-local <noreply@example.com>
+Date: Mon, 15 Sep 2026 16:00:00 -0700
+Subject: [PATCH] ARM: dts: sama7d65_curiosity: enable the 2D GPU
+
+The SAMA7D65 carries a Vivante GC520UL 2D graphics core, described in
+sama7d65.dtsi as gpu@e1480000 with its bus/core clocks and a 533 MHz GPU PLL
+assignment already in place, but left status = "disabled". No board DTS in the
+tree references &gpu, so the GPU is unavailable on every sama7d65 board -- the
+same is true of the GFX2D node on sam9x7, so this appears to be a deliberate
+opt-in-per-board convention rather than an oversight.
+
+Enable it on the Curiosity board so the nano2D kernel driver can bind and
+userspace (libm2d) can use the core for 2D blit, stretch-blit and blend
+operations. Without this the driver has nothing to probe against.
+
+Enabling it costs nothing when unused: the block stays gated until a driver
+claims it.
+
+Signed-off-by: meta-local <noreply@example.com>
+---
+ arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts b/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts
+--- a/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts
++++ b/arch/arm/boot/dts/microchip/at91-sama7d65_curiosity.dts
+@@ -703,6 +703,10 @@
+ 	status = "okay";
+ };
+
++&gpu {
++	status = "okay";
++};
++
+ &vddout25 {
+ 	vin-supply = <&vdd_3v3>;
+ 	status = "okay";

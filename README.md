@@ -176,6 +176,62 @@ figures above do **not** bound it.
 Note meta-flutter's README claims no OSS embedder supports software rendering. **That README
 is out of date** — its CHANGELOG is authoritative.
 
+## The 2D GPU (libm2d) — enabled, not yet used by Flutter
+
+The SoC has a **Vivante GC520UL 2D core**. It ships unusable: `sama7d65.dtsi` describes
+`gpu@e1480000` fully (reg, IRQ, bus/core clocks, 533 MHz GPU PLL) but leaves it
+`status = "disabled"`, and **no board DTS or overlay in the tree references `&gpu`**. The
+GFX2D node on sam9x7 is disabled the same way, so this is an opt-in-per-board convention.
+A consequence worth knowing: **EGT is not using the GPU either**, despite
+`packagegroup-mchp-graphics` already installing `libm2d` on this machine.
+
+`meta-local/recipes-kernel/linux/linux-mchp_6.18.bbappend` enables it with a DTS patch
+(`&gpu { status = "okay"; }`, scoped `:sama7d65`). A kernel patch rather than an overlay
+because the overlays here are packed into `sama7d65_curiosity.itb` and chosen by U-Boot's
+panel-detection logic — adding one would mean editing `dt-overlay-mchp`'s `.its` *and* the
+boot-time selection, for a block that is always present and has no board variation.
+
+**Verified on hardware** with `mchp-m2d-probe-image` (2026-09-16):
+
+```
+nano2d irq number is 194.
+create /dev/nano2d device.
+  register base:0xe1480000        <- matches the DTS node
+```
+
+`m2d_test` (from `libm2d`, assets in `/usr/share/m2d/` including 800×480 ones) renders
+visible output on the panel. The out-of-tree nano2D module 2.0.41 probes fine against kernel
+6.18.17.
+
+The stack, all pre-packaged in meta-mchp: `kernel-module-nano2d` (autoloads) + **`libnano2d2`**
+(the runtime package is *not* called `nano2d`) + `libm2d` 2.2.1 + `libplanes`.
+
+### What it can and cannot do
+
+From `include/m2d/m2d.h`: blit and fill (`m2d_draw_rectangles`), **stretched/scaled blit**,
+programmable blending (GL-like functions and factors), up to 8 sources per pass, lines,
+ARGB8888/RGB565/A8, dma-buf `m2d_import`, and **explicit** `m2d_sync_for_cpu`/`_for_gpu` cache
+management.
+
+There is **no path rasteriser, no text, no gradient op, no convolution and no antialiasing**.
+So it cannot touch the chart (80 ms), blur (155 ms) or live-gradient (141 ms) costs in the
+constraints table. It addresses image scaling, alpha compositing, fills and format conversion.
+
+### Why it is not wired into Flutter yet
+
+Flutter's software renderer hands the embedder *engine-owned* memory
+(`surface_present_callback`), which can only be copied out of — so zero-copy GPU access needs
+the **compositor API**, where the embedder allocates the backing store. But Flutter hands a
+compositor **one** backing-store layer unless platform views are in use, so Skia composites
+the whole widget tree — every alpha blend, every scaled image — in software before the
+compositor sees anything. The compositor route therefore accelerates the **present path**
+only, and its value depends on the unresolved floor question in
+[Open questions](#open-questions).
+
+The cheaper route that does attack scaling and gradients is `dart:ffi`: call libm2d from Dart
+to pre-scale assets and pre-render gradients once at startup, then draw them 1:1 (measured
+free). Plan: `~/.claude/plans/wobbly-orbiting-peach.md`.
+
 ## Build configuration
 
 These are **already applied** by `conf/templates/default/local.conf.sample` — the list below
