@@ -264,6 +264,36 @@ not the unit file: `tr '\0' '\n' < /proc/$(pgrep -x homescreen)/environ | grep ^
 is unset and tearing persists, grep for `force-clearing flip_pending_` — the watchdog
 submitting a flip mid-scanout because the completion event was not serviced in time.
 
+### Two traps in the auto-start kiosk path (both hit, both fixed)
+
+**Never order a unit `After=`/`Wants=` a `dev-dri-cardN.device` unit.** Device units exist
+only for devices udev tags `TAG+="systemd"`, and this image's `99-systemd.rules` tags
+`tty`, `block`, `net`, `sound`, `usb`, `ubi`, `ptp`, `bluetooth`, `udc`, `rfkill` — and
+**nothing in the `drm` subsystem**. `dev-dri-card0.device` therefore never activates and the
+unit never starts, with no error: `systemctl status` shows `inactive (dead)` while
+`systemctl list-jobs` shows the device job `waiting`. `flutter-demo-launcher` polls for
+`/dev/dri/card*` itself (bounded, 30 s) instead. The same applies to any future
+homescreen/EGT unit.
+
+**The gpio-keys input device has an EMPTY name — do not match on `"gpio-keys"`.**
+`gpio_keys.c` does `input->name = pdata->name ? : pdev->name`, where `pdata->name` is the
+`label` property of the **`gpio-keys` node**. This board's DTS labels only the *child*
+(`button { label = "PB_USER"; }`), so `pdata->name` is NULL and it falls back to
+`pdev->name`, which is `""` because `of_device_alloc()` builds OF platform devices with
+`platform_device_alloc("", …)`. Any `strstr(name, "gpio-keys")` fails. **Match by capability
+instead:** `EVIOCGBIT(EV_KEY, …)` and test for `KEY_0`. Watch the word size — the bitmap is
+an array of *kernel* `unsigned long`, 32-bit on this armv7 target and 64-bit on the build
+host, so index with `sizeof(long)` rather than a hardcoded 32 or 64. A USB keyboard also
+emits `KEY_0`, so demote candidates that additionally have `KEY_A`.
+
+The button itself is confirmed by the DTS: `PIN_PC10`, `GPIO_ACTIVE_LOW`, `linux,code =
+<KEY_0>`, `wakeup-source`. The keycode was never the problem; the lookup was.
+
+**A watcher's failure must not look like a success.** `userbtn-wait` originally returned 1
+when it found no device, and the launcher treated *any* exit as a press — so a broken button
+would have bounced straight out of every demo. It now exits `0` = pressed, `2` = no device,
+`3` = read error, and the launcher only returns to the menu on `0`.
+
 ## Commands
 
 ```sh

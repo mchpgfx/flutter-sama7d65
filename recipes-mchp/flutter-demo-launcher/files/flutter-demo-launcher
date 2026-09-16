@@ -31,6 +31,23 @@ HS_ARGS="--drm-connector $CONNECTOR --drm-no-seat"
 
 log() { echo "[demo-launcher] $*"; }
 
+# Wait for the DRM device ourselves rather than ordering the unit After= a
+# dev-dri-cardN.device unit. Device units only exist for devices udev TAGs with
+# "systemd", and this image's 99-systemd.rules tags tty/block/net/sound/usb but
+# NOTHING in the drm subsystem - so dev-dri-card0.device never activates and a unit
+# waiting on it never starts. That is exactly what happened.
+wait_for_drm() {
+    i=0
+    while [ "$i" -lt 150 ]; do
+        for c in /dev/dri/card*; do
+            [ -e "$c" ] && { log "drm device present: $c"; return 0; }
+        done
+        sleep 0.2; i=$((i + 1))
+    done
+    log "no /dev/dri/card* after 30s - is atmel-hlcdc bound?"
+    return 1
+}
+
 # SIGTERM, then SIGKILL if it will not go. Waiting matters: homescreen restores the
 # CRTC on exit, and starting the next instance before DRM master is released fails.
 stop_homescreen() {
@@ -62,6 +79,8 @@ run_bundle() {
 
 trap 'log "terminating"; [ -n "${HS_PID:-}" ] && stop_homescreen "$HS_PID"; exit 0' TERM INT
 
+wait_for_drm || exit 1
+
 while true; do
     rm -f "$CHOICE"
 
@@ -89,11 +108,25 @@ while true; do
     while kill -0 "$BTN_PID" 2>/dev/null && kill -0 "$HS_PID" 2>/dev/null; do
         sleep 0.2
     done
+
     if kill -0 "$BTN_PID" 2>/dev/null; then
+        # The demo went away first (exit or crash).
         log "demo exited on its own; returning to menu"
         kill -TERM "$BTN_PID" 2>/dev/null; wait "$BTN_PID" 2>/dev/null
     else
-        log "USER button pressed; returning to menu"
+        # userbtn-wait finished. Its status says WHY: 0 = pressed, anything else is a
+        # setup failure. Treating a failure as a press would bounce straight out of the
+        # demo, which is indistinguishable from the button working badly.
+        wait "$BTN_PID"; btn_status=$?
+        if [ "$btn_status" -eq 0 ]; then
+            log "USER button pressed; returning to menu"
+        else
+            log "userbtn-wait failed (exit $btn_status) - button disabled, leaving the"
+            log "demo up. Check its messages above; 2 means no input device emits KEY_0."
+            # Do not spin: just wait out the demo.
+            while kill -0 "$HS_PID" 2>/dev/null; do sleep 1; done
+            log "demo exited; returning to menu"
+        fi
     fi
 
     stop_homescreen "$HS_PID"; HS_PID=""

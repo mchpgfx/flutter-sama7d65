@@ -1,9 +1,10 @@
 [Unit]
 Description=Flutter demo launcher (menu + demo selection)
-# The DRM device must exist before the software sink can open it; waiting on the
-# device unit avoids a startup race that presents as an intermittent blank screen.
-Wants=dev-dri-card0.device
-After=dev-dri-card0.device systemd-udev-settle.service
+# NO Wants=/After=dev-dri-card0.device. Device units exist only for devices udev
+# TAGs with "systemd", and this image's 99-systemd.rules tags tty/block/net/sound/usb
+# but nothing in the drm subsystem, so dev-dri-card0.device never activates and this
+# unit sat waiting on it forever. The launcher polls for /dev/dri/card* itself.
+After=systemd-udev-trigger.service
 # The governor unit pins 1 GHz; the board otherwise idles at 90 MHz and the first
 # frames would render at a fraction of full clock.
 After=cpufreq-performance.service
