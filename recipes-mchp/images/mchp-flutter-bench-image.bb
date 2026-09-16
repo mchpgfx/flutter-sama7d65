@@ -30,7 +30,21 @@ IMAGE_INSTALL:append = "\
     ivi-homescreen-defaults \
     cpufreq-performance \
     flutter-hmi-bench \
+    libm2d \
+    nano2d \
+    kernel-module-nano2d \
+    m2d-caps \
 "
+
+# The 2D GPU stack is included ahead of any Flutter integration so that one flash
+# answers both open questions: the IVI_SW_VSYNC=0 run (which decides whether the
+# compositor route has any payoff) needs the Flutter image, and m2d-caps needs the
+# GPU. libm2d is also a prerequisite for the dart:ffi route regardless of which
+# way that decision goes, so nothing here is speculative.
+#
+# m2d-caps prints M2D_CAP_STRIDE_ALIGNMENT and friends; the stride alignment
+# dictates the row_bytes an m2d-allocated buffer must have before Skia can
+# rasterise into it.
 
 # cpufreq-performance pins the governor at boot. The board defaults to
 # 'conservative', which idles at 90 MHz of an available 1000 MHz and ramps in small
