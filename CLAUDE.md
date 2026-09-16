@@ -214,13 +214,55 @@ recompiling.
 line 521 calls `run_command(cmd, source_root, env)`, omitting the leading `d` that all other
 call sites pass, so it raises `TypeError`. One-line fix; worth reporting upstream.
 
-Goal is a **GUI design-constraints table** against a **30 FPS / 33 ms** budget, covering
-gauges, lists, status screens and media/charts. Frame timings come from the app via
-`SchedulerBinding.addTimingsCallback`, reporting **build vs raster separately** (a CPU
-rasteriser should be raster-bound; build-bound would be a different, fixable problem) and
-**median + p95**, since jank matters more than the mean.
+### Performance: settled, and the budget is 19.0 ms not 33 ms
 
-Plan: `~/.claude/plans/wobbly-orbiting-peach.md`.
+The panel is **52.64 Hz = 19.0 ms/refresh**. `DrmDumbSink::Present()` busy-waits on
+`flip_pending_` for the previous page flip, double-buffered, so **frame rate is quantised**:
+52.6 / 26.3 / 17.5 fps. A screen needing 20 ms runs at 26 fps, not 50. Design to **19.0 ms**
+of build + raster.
+
+**A constant per-frame floor is pacing, not cost.** Cheap scenes all reported raster
+18.4-18.9 ms regardless of content because that is the flip wait. `IVI_SW_VSYNC=0` does not
+move it (that gates the engine's vsync baton, a different mechanism) — read the sink's
+`Present()` rather than inferring from experiments.
+
+**Content-only costs** (`IVI_SW_SINK=none`, frames discarded): progress bars 6.2, big digits
+7.7, opacity/saveLayer 7.9, image 1:1 8.1, fullscreen fill 8.8, value updates 8.4, lists
+11-15, **needle WITH RepaintBoundary 11.7 vs 21.2 WITHOUT** (a real 1.8x on identical
+drawing). Over budget: arc+ticks 32, BoxShadow 43, ClipRRect AA 50, image scaled 72-103,
+charts 141, blur 180, gradient 256, alpha stack 280.
+
+**Measurement traps.** `IVI_SW_SINK=memory` is NOT a neutral baseline — it was *slower* than
+the display path (charts 46 -> 151) with `buildDuration` rising too, i.e. system-wide
+contention from cacheable writes and per-frame allocation versus the dumb buffer's
+write-combining streaming map. Use `none`. But even `none` removes pacing, so **expensive**
+scenes inflate through thread contention on the single core; trust `none` for sub-refresh
+scenes and drm-dumb for the rest. `baseline.static_text` runs first and is a warm-up artefact.
+
+### libm2d: enabled, deliberately not used
+
+The GPU works (see [[sama7d65-2d-gpu-enablement]]) but the only operation it could take over
+is the present blit, worth **2-4 ms**. It would need the compositor API, embedder-allocated
+`m2d_alloc` backing stores, and ~1.5 MB/frame of cache maintenance on a non-coherent GPU —
+plausibly costing what it saves — and would not touch the flip wait.
+`M2D_CAP_STRETCHED_BLIT` and `M2D_CAP_DRAW_LINES` are `/* not implemented yet */` in libm2d
+(software gaps, not hardware limits), so no scaling or chart help either. If offloading is
+revisited, the display controller's **two overlay planes** (alpha, rotation, YUV on plane 39)
+are the better target — no GPU, no cache maintenance, no patched embedder.
+
+### Field findings from the customer pilot
+
+**Pin the connector.** The sink takes the first connector that is `connected` with >=1 mode,
+and **LVDS has no hotplug detect** so all LVDS connectors report connected regardless of what
+is fitted. This board shows LVDS-1 and LVDS-2 with identical modes but one encoder (44) and
+one CRTC (43); LVDS-2 has encoder 0. Selection reduces to enumeration order and can bind an
+undrivable output — intermittent blank screen. Pass `--drm-connector LVDS-1`; pinned, it fails
+loudly instead of silently.
+
+**Never ship `IVI_SW_VSYNC=0`.** Measurement tool only; it tears. Check the running process,
+not the unit file: `tr '\0' '\n' < /proc/$(pgrep -x homescreen)/environ | grep ^IVI_`. If it
+is unset and tearing persists, grep for `force-clearing flip_pending_` — the watchdog
+submitting a flip mid-scanout because the completion event was not serviced in time.
 
 ## Commands
 

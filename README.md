@@ -18,7 +18,7 @@ Two images are useful here:
 | CPU | **Single-core** Cortex-A7 @ 1 GHz |
 | RAM | 1 GB (`cma=192m` reserved for display) |
 | GPU | Vivante GC, **2D only — no OpenGL ES** |
-| Display | 800×480 LVDS (ST7262) @ 53 Hz, **16 bpp** |
+| Display | 800×480 LVDS (ST7262) @ **52.64 Hz** (19.0 ms/refresh), **16 bpp** |
 | Touch | Atmel maXTouch |
 
 There is no 3D GPU, so **all rendering is done on the CPU**. Everything below follows from
@@ -30,10 +30,16 @@ Working on hardware: Flutter 3.47.4 engine (armv7, **AOT**, LTO), `ivi-homescree
 software backend rendering Skia CPU output straight into a DRM dumb buffer, touch and keyboard
 input, text, and 25 apps installed including a scene-based render benchmark.
 
-**Performance is measured.** A conventional instrument/HMI UI — text, vector gauges, lists,
-value readouts, 1:1 images — runs at the display's refresh ceiling. Image scaling, gradients,
-shadows, blur and stacked translucency are 4–10× over budget and must be designed out. See
+**Performance is measured.** The per-frame budget is **19.0 ms** (one 52.64 Hz refresh), and
+frame rate steps rather than degrades — 52.6 / 26.3 / 17.5 fps. A conventional instrument UI
+(text, large digits, value readouts, progress bars, lists, 1:1 images, `RepaintBoundary`-bounded
+gauges) costs 6–12 ms and has real headroom. Runtime image scaling, gradients, shadows, blur and
+stacked translucency are 2–15× over and must be designed out. See
 [GUI design constraints](#gui-design-constraints-measured).
+
+**Shipped to a customer pilot.** Two field findings are folded into
+[Troubleshooting](#troubleshooting): pin `--drm-connector` explicitly, and never ship
+`IVI_SW_VSYNC=0`.
 
 ## Quick start
 
@@ -217,20 +223,24 @@ There is **no path rasteriser, no text, no gradient op, no convolution and no an
 So it cannot touch the chart (80 ms), blur (155 ms) or live-gradient (141 ms) costs in the
 constraints table. It addresses image scaling, alpha compositing, fills and format conversion.
 
-### Why it is not wired into Flutter yet
+### Why it is not used — measured, and settled
 
-Flutter's software renderer hands the embedder *engine-owned* memory
-(`surface_present_callback`), which can only be copied out of — so zero-copy GPU access needs
-the **compositor API**, where the embedder allocates the backing store. But Flutter hands a
-compositor **one** backing-store layer unless platform views are in use, so Skia composites
-the whole widget tree — every alpha blend, every scaled image — in software before the
-compositor sees anything. The compositor route therefore accelerates the **present path**
-only, and its value depends on the unresolved floor question in
-[Open questions](#open-questions).
+The only operation the GPU could take over is the ARGB8888→RGB565 present blit, and **that
+costs roughly 2–4 ms** — see [Why the 2D GPU is not used](#why-the-2d-gpu-is-not-used-despite-being-enabled)
+for the derivation. Three reasons it is not worth building:
 
-The cheaper route that does attack scaling and gradients is `dart:ffi`: call libm2d from Dart
-to pre-scale assets and pre-render gradients once at startup, then draw them 1:1 (measured
-free). Plan: `~/.claude/plans/wobbly-orbiting-peach.md`.
+- Flutter's software renderer hands the embedder *engine-owned* memory
+  (`surface_present_callback`) which can only be copied out of. Zero-copy needs the
+  **compositor API** with embedder-allocated `m2d_alloc` backing stores — a patch against a
+  third-party embedder we would then maintain.
+- Flutter hands a compositor **one** backing-store layer unless platform views are in use, so
+  Skia composites the whole widget tree — every alpha blend, every scaled image — in software
+  before the compositor sees anything. Only the present path is reachable.
+- Explicit cache maintenance on a non-coherent GPU (`m2d_sync_for_cpu`/`_for_gpu`) flushing
+  ~1.5 MB per frame could plausibly cost what the swizzle costs.
+
+None of it touches the flip wait, which is the larger part of the per-frame floor and is the
+display pacing the renderer, not work.
 
 ## Build configuration
 
@@ -345,6 +355,8 @@ The failures in this stack tend to be silent. Symptom → cause:
 | Build killed, no `^ERROR` in log | OOM. Lower parallelism. sstate survives — just re-run to resume. |
 | `bitbake-getvar` hangs | A build holds the server lock. |
 | `MESA-LOADER: failed to open atmel-hlcdc`, `Failed to restore original CRTC: -2` | **Benign.** Expected fallback and exit noise. |
+| **Intermittent blank screen on a fielded unit** | The sink picks the *first* connector that is `connected` with ≥1 mode, and **LVDS has no hotplug detect** — every LVDS connector reports `connected` whether a panel is fitted or not. This board exposes LVDS-1 **and** LVDS-2 with identical modes but only **one encoder (44) and one CRTC (43)**; LVDS-2 has encoder `0`. So selection reduces to enumeration order and can bind an undrivable output. **Fix: pass `--drm-connector LVDS-1`** (or whichever connector has a bound encoder — check `modetest -M atmel-hlcdc`). When pinned, the sink fails loudly instead of falling back silently. |
+| **Tearing during scroll** | Check `IVI_SW_VSYNC` in the *running* process — `tr '\0' '\n' < /proc/$(pgrep -x homescreen)/environ \| grep ^IVI_`. `IVI_SW_VSYNC=0` is a **measurement tool only** and tears by design; it must never ship. If it is unset, grep the log for `force-clearing flip_pending_`: the sink watchdog force-clears when a flip-completion event is not serviced in time and then submits a flip mid-scanout. That indicates event-loop starvation on the single core under load. |
 
 Two habits that save time here: require BitBake's own `rc=0` **and** zero `^ERROR` lines (a
 wrapper script exiting 0 around a failed build has caused a false "success"), and verify the
@@ -394,84 +406,103 @@ before treating any number on this class of board as a hardware limit.
 
 ## GUI design constraints (measured)
 
-Measured 2026-09-15 with `flutter-hmi-bench` on hardware at 1 GHz / 16 bpp: 23 scenes, 20
-warm-up plus 90 measured frames each, timings from `SchedulerBinding.addTimingsCallback`.
-Budget: **30 fps = 33 ms/frame**.
+Measured on hardware at 1 GHz / 16 bpp with `flutter-hmi-bench` (23 scenes, 20 warm-up plus 90
+measured frames each, timings from `SchedulerBinding.addTimingsCallback`). Revised 2026-10-07
+after establishing what the per-frame floor actually was.
 
-**Everything is raster-bound.** `buildDuration` was 2.5–12 ms in every scene, so the UI
-thread is never the constraint — only pixels are.
+### The budget is 19.0 ms, and frame rate is quantised
 
-### The ~18.6 ms floor — read the table with this in mind
+The panel runs **52.64 Hz** (25 MHz pixel clock over 933x509 total) = **19.0 ms per refresh**.
+`DrmDumbSink::Present()` busy-waits on `flip_pending_` for the previous page flip to retire
+before it swizzles, and the sink is double-buffered. So frame rate steps rather than degrades:
 
-Every cheap scene reported `raster_med` of 18.1–18.9 ms regardless of content, from bare text
-to a full-screen fill. **The panel runs 53 Hz = 18.87 ms per refresh**, so those scenes are
-**display-bound, not CPU-bound**: their true content cost is hidden beneath a vsync wait or a
-fixed full-screen present cost. Anything at the floor has unknown (but positive) headroom;
-anything well above it is genuinely work-bound.
+| Refreshes per frame | Frame rate |
+|---|---|
+| 1 | 52.6 fps |
+| 2 | 26.3 fps |
+| 3 | 17.5 fps |
 
-### Constraints table
+**A screen needing 20 ms of work does not run at 50 fps - it runs at 26.** Design to fit
+**19.0 ms** of build + raster. (An earlier revision of this table used a 33 ms / 30 fps budget;
+that was the wrong shape of target for a flip-paced display.)
 
-| Technique | raster med (ms) | Verdict |
-|---|---|---|
-| Static text, gauge face, arc/ticks, large digits | 18.6–18.8 | ✅ at floor |
-| Animated needle, with **or** without `RepaintBoundary` | 18.7–18.8 | ✅ at floor |
-| List scroll — plain text, and icons + dividers | 14.4–17.5 | ✅ at floor |
-| Switches, progress bars, periodic value updates | 18.1–18.8 | ✅ at floor |
-| Image drawn **1:1**, `FilterQuality.none` | 18.6 | ✅ at floor |
-| Opacity animation (`saveLayer`) over sparse text | 18.6 | ✅ but see caveat |
-| Antialiased `ClipRRect` (×6) | 21.0 (p95 34.1) | ⚠️ marginal |
-| Waveform / line chart, 3 × 267-point polylines | 78–80 | ❌ 6.6 fps |
-| `BoxShadow` / Material elevation (×8) | 79.6 | ❌ 6.7 fps |
-| Image scaled 1.7×, `FilterQuality.low` | 131.2 | ❌ 3.9 fps |
-| **Full-screen linear gradient** | 141.6 | ❌ 3.6 fps |
-| `BackdropFilter` blur | 154.9 | ❌ 3.3 fps |
-| Stacked translucent layers (×6) | 189.3 | ❌ 2.7 fps |
-| Image scaled 1.7×, `FilterQuality.medium` | 190.5 | ❌ 2.7 fps |
+### Two measurement conditions, and how to read them
 
-**The cliff is ~4×, not gradual.** Techniques sit either at the floor or 4–10× over budget,
-with almost nothing in between — so design decisions here are binary rather than a matter of
-tuning.
+`raster_med`, milliseconds. **In situ** is the shipping configuration (`drm-dumb`, vsync off).
+**Content only** is `IVI_SW_SINK=none` - frames discarded, so no swizzle and no flip wait.
+
+| Technique | in situ | content only | verdict vs 19.0 ms |
+|---|---|---|---|
+| Progress bars | 18.7 | **6.2** | ✅ ample headroom |
+| Large digits, tabular figures | 18.8 | **7.7** | ✅ |
+| Opacity animation (`saveLayer`, sparse subtree) | 18.8 | **7.9** | ✅ |
+| Image drawn **1:1**, `FilterQuality.none` | 18.8 | **8.1** | ✅ |
+| Full-screen solid fill | 18.8 | **8.8** | ✅ |
+| List scroll, icons + dividers | 16.8 | **11.3** | ✅ |
+| Switches / checkboxes | 18.9 | **11.6** | ✅ |
+| **Animated needle WITH `RepaintBoundary`** | 18.8 | **11.7** | ✅ |
+| Periodic text value updates | 18.8 | **8.4** | ✅ |
+| List scroll, plain text | 16.1 | **15.0** | ✅ marginal |
+| Static gauge face (`CustomPaint`) | 18.8 | 20.5 | ⚠️ just over |
+| **Animated needle WITHOUT `RepaintBoundary`** | 18.8 | **21.2** | ⚠️ 1.8x the bounded version |
+| Arc + tick vector drawing | 18.8 | 31.6 | ❌ |
+| `BoxShadow` / Material elevation (x8) | 45.3 | 43.1 | ❌ |
+| Antialiased `ClipRRect` (x6) | 18.9 | 49.7 | ❌ in situ OK, see note |
+| Image scaled 1.7x, `FilterQuality.low` | 69.9 | 71.6 | ❌ |
+| Image scaled 1.7x, `FilterQuality.medium` | 100.8 | 102.5 | ❌ |
+| Waveform / line chart, 3 x 267 points | 46.3 | 140.7 | ❌ |
+| `BackdropFilter` blur | 83.7 | 179.7 | ❌ |
+| Full-screen linear gradient | 76.1 | 255.7 | ❌ |
+| Stacked translucent layers (x6) | 99.8 | 279.6 | ❌ |
+
+**Read the two columns differently.** For scenes under one refresh, *in situ* is dominated by
+the flip wait and hides the real cost - the content column is the truth and shows genuine
+headroom. For scenes over one refresh, the reverse: removing pacing also removes the idle gaps
+between frames, so both threads contend on the single core and the content column **inflates**
+(charts 141 ms with `none` versus 46 ms in situ). Use *in situ* for those.
+
+`clip_rrect_antialiased` shows this most starkly - 18.9 ms in situ, 49.7 ms unpaced. Treat it
+as workable in the shipping configuration but with no headroom.
+
+`baseline.static_text` reported 49.0 ms content-only, wildly out of line with every comparable
+scene. It runs first; treat it as a warm-up artefact, not data.
 
 ### Design rules
 
-1. **Never scale images at runtime.** 1:1 is free; 1.7× costs 7×, and `FilterQuality.medium`
-   costs 10×. Pre-size every asset to its exact on-screen pixel size; cap decode with
-   `cacheWidth`/`cacheHeight`; use `FilterQuality.none` or `.low`.
-2. **No full-screen gradients.** One `ui.Gradient.linear` across 800×480 costs 141 ms. Use
-   flat fills, or a small pre-rendered gradient bitmap drawn 1:1.
-3. **No stacked translucency.** Six semi-transparent rectangles cost 189 ms. Composite opacity
-   into flat opaque colours at design time.
-4. **No shadows, no blur.** `BoxShadow` 80 ms, `BackdropFilter` 155 ms. Use borders, rules or
-   flat colour steps for depth.
-5. **Charts need an explicit budget.** 80 ms for 3 × 267 points. Decimate to at most one point
-   per horizontal pixel, cache static grid/axes behind a `RepaintBoundary`, and prefer
-   1 px non-antialiased strokes.
-6. **Everything a conventional instrument UI needs is affordable**: text, large digits, vector
-   gauges and needles, lists, switches, progress bars, periodic value updates, and 1:1 images.
+1. **`RepaintBoundary` around anything animated.** Measured **11.7 ms versus 21.2 ms** for
+   identical needle drawing - 1.8x, and the difference between fitting a refresh and missing it.
+   Cost tracks pixels touched, so keep animated regions physically small.
+2. **Never scale images at runtime.** 1:1 is 8.1 ms; 1.7x is 72-103 ms. Pre-size every asset to
+   its exact on-screen pixels; cap decode with `cacheWidth`/`cacheHeight`; use
+   `FilterQuality.none`. The 2D GPU cannot help - `M2D_CAP_STRETCHED_BLIT` is unimplemented.
+3. **No full-screen gradients** (256 ms). Use flat fills or a small pre-rendered gradient
+   bitmap drawn 1:1.
+4. **No stacked translucency** (280 ms). Composite opacity into flat opaque colours at design
+   time.
+5. **No blur** (180 ms) and **no `BoxShadow`** (43 ms). Borders or flat colour steps instead.
+6. **Charts need a budget.** 141 ms unpaced / 46 ms in situ for 3 x 267 points. Decimate to at
+   most one point per horizontal pixel, cache static grid and axes behind a `RepaintBoundary`,
+   prefer 1 px non-antialiased strokes.
+7. **Everything a conventional instrument UI needs is comfortably affordable**: text, large
+   digits, value readouts, progress bars, switches, lists, 1:1 images, and bounded animated
+   gauges - all 6-12 ms against a 19.0 ms budget.
 
-### Caveats on these figures
+### Why the 2D GPU is not used, despite being enabled
 
-- **The `RepaintBoundary` comparison measured nothing.** With/without came out 18.7 vs 18.8
-  because both were clamped at the floor. The benefit is real but only visible once a scene
-  exceeds the floor — re-test by wrapping something expensive (a chart), not a cheap needle.
-- **The `saveLayer` pass is weak evidence.** That scene wraps sparse text, so the offscreen
-  layer covers little. `BackdropFilter` (155 ms) and antialiased clips (21 ms) also use
-  `saveLayer` and cost more, so treat opacity animation over a large or busy subtree as
-  expensive despite this result.
+The swizzle the GPU could take over costs roughly **2-4 ms** - derived from the consistent
+10-12.5 ms gap between in-situ and content-only on five unrelated cheap scenes, most of which
+must be the flip wait. Offloading it would require the Flutter compositor API, embedder-
+allocated `m2d_alloc` backing stores, and explicit cache maintenance flushing ~1.5 MB per frame
+on a non-coherent GPU - plausibly costing as much as it saves - while not touching the flip
+wait at all. The existing path is well matched to the hardware: a NEON `vld4_u8`/`vst4_u8`
+swizzle streaming into a write-combining dumb buffer.
 
-## Open questions
+Evidence for that last point: `IVI_SW_SINK=memory`, which writes to ordinary cacheable heap,
+was **slower than the display path** (charts 46 -> 151 ms) with `buildDuration` rising too.
 
-**Is the 18.6 ms floor a vsync wait or a fixed present cost?** This decides how much of the
-33 ms budget is actually available for content. One run settles it:
-
-```sh
-IVI_SW_VSYNC=0 homescreen -b /usr/share/flutter/flutter_hmi_bench/3.47.4/release
-```
-
-If the cheap scenes fall well below 18.6 ms raster, it was vsync and real headroom exists.
-If they hold at ~18.6 ms, it is a hard floor — a full-screen blit plus 32→16 conversion into
-the dumb buffer — which would cap the display near 50 fps with no content at all, and mean
-roughly 14 ms of the 33 ms budget is left for drawing.
+If offloading is ever revisited, the **display controller's two overlay planes** (with `alpha`
+and `rotation`, plus YUV on plane 39) are the better target - hardware compositing at scanout,
+no GPU, no libm2d, no cache maintenance, no patched embedder.
 
 ## Reference
 
