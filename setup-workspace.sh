@@ -12,8 +12,8 @@
 #     git clone ssh://git@bitbucket.microchip.com/mg/flutter.git meta-local
 #     ./meta-local/setup-workspace.sh
 #
-# Host prerequisites (including the mandatory AppArmor profile on Ubuntu 24.04)
-# are in meta-local/README.md - read that first; BitBake will not run without it.
+# Host prerequisites (including the mandatory AppArmor profile on Ubuntu 24.04) are
+# in meta-local/BUILDING.md - read that first; BitBake will not run without them.
 
 set -eu
 
@@ -55,7 +55,10 @@ cat <<'EOF'
 
     export TEMPLATECONF=../meta-local/conf/templates/default
     source openembedded-core/oe-init-build-env build
-    bitbake mchp-flutter-bench-image
+    bitbake mchp-flutter-gallery-image        # boots into the Flutter demo menu
+
+Full step-by-step instructions, including the mandatory Ubuntu 24.04 AppArmor
+profile and how to verify and flash the result: meta-local/BUILDING.md
 
 TEMPLATECONF is only read the first time oe-init-build-env runs for a build
 directory; it seeds build/conf/{local,bblayers}.conf from meta-local's template.

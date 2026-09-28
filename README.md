@@ -47,6 +47,12 @@ agnostic** — see [One image, any panel size](#one-image-any-panel-size).
 
 ## Quick start
 
+**Building on a fresh machine? Read [BUILDING.md](BUILDING.md) instead** — it is the
+step-by-step version of this section, aimed at someone who has not seen the project before,
+and it builds the demo image rather than the benchmark one. What follows here is the condensed
+form.
+
+
 ### 1. Host prerequisites (Ubuntu 24.04)
 
 ```bash
