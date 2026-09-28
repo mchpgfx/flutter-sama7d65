@@ -557,6 +557,40 @@ fill-rate bound, and on a CPU rasteriser cost tracks pixels touched.
 Engine `lto` is also enabled, but expect much less from it: it tightens the code that touches
 each pixel without reducing how many pixels are touched.
 
+#### Setting the governor and DVFS operating point by hand
+
+`cpufreq-performance` does this at boot, but for experiments on a running board:
+
+```sh
+# Read the current state. Single core, so cpu0 is all there is.
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor     # stock: conservative
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq     # pinned: 1000000
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+
+# Pin maximum clock.
+echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+```
+
+`cpupower frequency-set -g performance` does the same if the package is installed; the sysfs
+write needs nothing extra.
+
+**To pin one specific OPP, switch to `userspace` first** — `scaling_setspeed` is silently
+ignored under every other governor:
+
+```sh
+echo userspace > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+echo 600000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed
+```
+
+The OPP table on this board is **90000 / 250000 / 600000 / 800000 / 1000000 kHz**. Pinning a
+lower OPP and re-running `flutter-hmi-bench` is the cheapest way to learn how much clock
+headroom a design actually has — useful before committing to a lower-power configuration.
+
+**`performance` holds 1 GHz continuously**, which raises power draw and die temperature. That is
+right for a bench or demo image; a shipped product more likely wants `ondemand` or `schedutil`
+with a lowered `up_threshold` — most of the responsiveness without the constant draw. Check
+`/sys/class/thermal/thermal_zone*/temp` under sustained load either way.
+
 **Caveat on earlier figures.** Everything measured before the governor was changed — including
 the `glmark2 Score: 1` that ruled out software OpenGL ES — was taken with `conservative`
 active, so those numbers are pessimistic by an unknown factor. The GLES conclusion very likely
@@ -645,10 +679,99 @@ swizzle streaming into a write-combining dumb buffer.
 Evidence for that last point: `IVI_SW_SINK=memory`, which writes to ordinary cacheable heap,
 was **slower than the display path** (charts 46 -> 151 ms) with `buildDuration` rising too.
 
-If offloading is ever revisited, the **display controller's two overlay planes** (with `alpha`
-and `rotation`, plus YUV on plane 39) are the better target - hardware compositing at scanout,
-no GPU, no libm2d, no cache maintenance, no patched embedder.
+If offloading is ever revisited, the **display controller's two overlay planes** are the better
+target - hardware compositing at scanout, no GPU, no libm2d, no cache maintenance, no patched
+embedder. What they can actually do, read from the driver rather than from a `modetest` listing,
+is in the plane-property table below.
 
+
+#### Two plausible optimisations that do not work
+
+Both come up naturally and both are refuted by the sources, so the refutations are recorded
+here with file references rather than left to be re-derived.
+
+**"Render in ARGB/XRGB so no swizzle is needed."** There is no format in which the CPU stops
+touching every pixel. `Present(const void* allocation, ...)` receives **engine-owned** memory —
+Skia's own buffer — so the copy exists because source and scanout are separate allocations, not
+because of colour conversion. `SwizzleInto()` in `shell/backend/software/drm_dumb_sink.cc`
+dispatches on `IVI_SW_DRM_FORMAT`:
+
+| Format | Function | Per-pixel work |
+|---|---|---|
+| `rgb565` | `FlutterToRGB565` | `vld4_u8` deinterleave + widening shift + 2× `vsri` to pack 5/6/5 |
+| `xrgb8888` (default) | `FlutterToBGRX8888` → `CopyWithAlphaForce` | `vld1q_u8` + `vorrq_u8` + `vst1q_u8` |
+
+XRGB is already close to minimal — load, OR, store — and the bandwidth goes the wrong way. At
+800×480 the source is always 4 B/px:
+
+```
+RGB565    read 1500K + write  750K = 2250K/frame   (40 MB/s at 52.6 Hz)
+XRGB8888  read 1500K + write 1500K = 3000K/frame   (81 MB/s)   = +33%
+```
+
+Which is why 16 bpp measured faster on hardware. The 565 pack spends a few more ALU ops and
+writes half the bytes; memory traffic dominates on this part. Keep `IVI_SW_DRM_FORMAT=rgb565`.
+
+**"Overlay planes need ARGB to alpha-blend onto the base."** They do not.
+`atmel_hlcdc_plane.c` (XLCDC path) sets the blend factors unconditionally for every non-primary
+plane (`SFACTC_A0_MULT_AS`, `DFACTC_M_A0_MULT_AS`, `SFACTA_ONE`, `DFACTA_ONE`) and then:
+
+```c
+if (format->has_alpha)
+        cfg |= ATMEL_XLCDC_LAYER_A0(0xff);              /* per-pixel alpha; A0 pinned opaque */
+else
+        cfg |= ATMEL_XLCDC_LAYER_A0(state->base.alpha); /* the DRM plane alpha property */
+```
+
+The overlay blends either way; the alpha channel only decides where the coefficient comes from.
+`drm_plane_create_alpha_property()` exposes that property to userspace.
+
+| Want | Overlay format | Cost |
+|---|---|---|
+| Fade or dim a whole overlay | **RGB565** + plane `alpha` property | 2 B/px |
+| Hard-edged overlay, transparent background | **RGB565** + `chroma_key` | 2 B/px |
+| Soft per-pixel edges | ARGB8888 (`A0` forced to `0xff`) | 4 B/px |
+
+Both overlays carry `chroma_key` and `chroma_key_mask`, so colour-keyed transparency at 16 bpp
+covers most HMI cases — a needle, a popup, a status bar — with no alpha channel at all. And the
+**base layer stays RGB565 regardless**: nothing about an overlay forces the full-screen surface
+Flutter repaints every frame to 32 bpp, which is the traffic that matters.
+
+**Which plane gets which property** (`atmel_hlcdc_plane.c`, ~line 1015) — the gating is exact:
+
+| Property | Condition | On sama7d65 |
+|---|---|---|
+| `alpha` | `type` is OVERLAY or CURSOR | `overlay1`, `high-end-overlay` — **not** `base` |
+| `rotation` (0/90/180/270) | `layout.xstride[0] && layout.pstride[0]` | `overlay1`, `high-end-overlay` — **not** `base`, whose layout has no `pstride` |
+| CSC (YUV) | `layout.csc` | `high-end-overlay` only |
+
+So **the full-screen Flutter surface cannot be rotated by the display controller** — overlays
+only. Worth knowing before planning a portrait-mounted panel around DC rotation.
+
+*Unverified, check before designing on it:* `atmel_hlcdc_plane.c:678` tests
+`ovl_s->fb->format->has_alpha || ovl_s->alpha != DRM_BLEND_ALPHA_OPAQUE`, probably gating the
+"disc area" optimisation that punches a hole in the base layer so occluded pixels are not
+fetched. If so, a *translucent* overlay forfeits that saving. Not traced.
+
+**The blocker is unchanged, and it is not the pixel format: Flutter hands the embedder ONE
+layer.** Getting distinct elements onto separate DRM planes needs the compositor API plus
+platform views — unproven on this embedder, and `disable-plugins` removes the machinery they
+normally rely on.
+
+#### There is no NEON-vs-GPU benchmark, and the 2–4 ms is inferred
+
+Worth stating plainly, because the two get conflated. **NEON was never a toggleable variable**:
+Skia's rasteriser and `pixel_swizzle.h` are already NEON, and the tune is
+`cortexa7hf-neon-vfpv4`, so every number in the constraints table is a NEON number — there is
+no non-NEON figure to compare against. **No Flutter frame has ever gone through libm2d**, so
+there is no GPU frame time either. The only GPU-adjacent *score* on record, `glmark2 Score: 1`,
+is **software** GL running on the CPU (softpipe) — not the 2D GPU.
+
+And the **2–4 ms** swizzle cost is an *inference* from the consistent 10–12.5 ms gap between
+in-situ and content-only runs, most of which is the flip wait. `IVI_SW_PROFILE` together with
+`IVI_SW_STOP_AFTER_FRAMES` yields a direct measurement in a single boot with no code written.
+**If the swizzle turns out to be under a millisecond, every question in this section is closed
+on arithmetic** — so get that number before building anything here.
 ## Optimisation guidelines
 
 Ordered by measured or expected value. Everything in Tier 1 is under your control in Dart and
@@ -749,7 +872,9 @@ embedder patch to `poll()` the DRM fd would remove both.
 
 | Idea | Why not |
 |---|---|
-| libm2d / 2D GPU offload of the present blit | The swizzle is only 2–4 ms. Needs the compositor API, embedder-allocated backing stores and ~1.5 MB/frame of cache maintenance on a non-coherent GPU — plausibly costing what it saves — and does not touch the flip wait |
+| libm2d / 2D GPU offload of the present blit | The swizzle is only 2–4 ms (**inferred**, not measured — see [Why the 2D GPU is not used](#why-the-2d-gpu-is-not-used-despite-being-enabled)). Needs the compositor API, embedder-allocated backing stores and ~1.5 MB/frame of cache maintenance on a non-coherent GPU — plausibly costing what it saves — and does not touch the flip wait |
+| Rendering in ARGB/XRGB to avoid the swizzle | No format stops the CPU touching every pixel: `Present()` gets engine-owned memory, so the copy is about separate allocations, not colour conversion. 32 bpp also writes +33% bytes |
+| ARGB for overlay-plane blending | Not required — an RGB565 overlay blends via the DRM `alpha` plane property, or `chroma_key` for hard edges |
 | Software OpenGL ES (llvmpipe / softpipe) | llvmpipe segfaults on armv7; softpipe scores `glmark2 Score: 1` |
 | `-O3` or other compiler flags | Already `-O2` + LTO + NEON + `-mcpu=cortex-a7`. The hot paths are Skia's hand-written NEON intrinsics and memory traffic; `-O3` risks hurting via I-cache pressure on a 32 KB L1 |
 | Hardware line drawing for charts | `M2D_CAP_DRAW_LINES` is unimplemented in libm2d, and Skia would not call it in any case |
@@ -764,6 +889,10 @@ embedder patch to `poll()` the DRM fd would remove both.
 - **Panel-size projections are arithmetic, not measured.** The 1280x800 column in
   [One image, any panel size](#one-image-any-panel-size) scales the 800x480 numbers by pixel
   count. Re-run `flutter-hmi-bench` on any new panel before trusting it.
+- **The swizzle cost has never been measured directly.** The 2–4 ms figure is inferred from the
+  in-situ vs content-only gap, most of which is the flip wait. `IVI_SW_PROFILE` plus
+  `IVI_SW_STOP_AFTER_FRAMES` settles it in one boot with no code. Under a millisecond and the
+  whole 2D-GPU/overlay-plane question closes on arithmetic — so this blocks that work, cheaply.
 - **No on-screen keyboard exists in this stack.** `TextField` asks the embedder for one and the
   software backend provides none; with `disable-plugins` the platform channel is not compiled in
   either. Draw a keypad in Dart with `readOnly: true` on the field, or design around text entry.
