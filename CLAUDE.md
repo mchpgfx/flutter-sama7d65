@@ -267,8 +267,105 @@ is the present blit, worth **2-4 ms**. It would need the compositor API, embedde
 plausibly costing what it saves — and would not touch the flip wait.
 `M2D_CAP_STRETCHED_BLIT` and `M2D_CAP_DRAW_LINES` are `/* not implemented yet */` in libm2d
 (software gaps, not hardware limits), so no scaling or chart help either. If offloading is
-revisited, the display controller's **two overlay planes** (alpha, rotation, YUV on plane 39)
-are the better target — no GPU, no cache maintenance, no patched embedder.
+revisited, the display controller's **two overlay planes** are the better target — no GPU, no
+cache maintenance, no patched embedder. See "Overlay planes" below for what they can actually
+do, read out of the driver rather than from the `modetest` listing.
+
+### The present blit: what the format actually costs, and why ARGB is not a shortcut
+
+Read `shell/backend/software/drm_dumb_sink.cc` and `pixel_swizzle.h` at the pinned
+`HOMESCREEN_COMMIT` (`131cbc37`) before theorising about this. `Present()` calls
+`SwizzleInto()`, which dispatches on `IVI_SW_DRM_FORMAT`:
+
+| Format | Function | Per-pixel work |
+|---|---|---|
+| `rgb565` | `FlutterToRGB565` | `vld4_u8` deinterleave + widening-shift + 2× `vsri` to pack 5/6/5 |
+| `xrgb8888` (default) | `FlutterToBGRX8888` → `CopyWithAlphaForce` | `vld1q_u8` + `vorrq_u8` + `vst1q_u8` — a NEON memcpy forcing alpha to 0xFF |
+
+**Switching to XRGB/ARGB does not remove a pass over the frame.** There is no format in which
+the CPU stops touching every pixel: Skia renders into *engine-owned* memory and `Present()`
+receives a pointer to it, so the copy exists because source and scanout are different
+allocations — not because of colour conversion. XRGB is already near-minimal (load, OR, store).
+
+**And the bandwidth goes the wrong way.** At 800x480, source is always 4 B/px:
+
+```
+RGB565    read 1500K + write  750K = 2250K/frame  (40 MB/s at 52.6 Hz)
+XRGB8888  read 1500K + write 1500K = 3000K/frame  (81 MB/s)  = +33%
+```
+
+Which is why 16 bpp measured faster on hardware. The 565 pack spends a few more ALU ops and
+writes half the bytes; on this part memory traffic dominates. Keep
+`IVI_SW_DRM_FORMAT=rgb565`.
+
+### Overlay planes: RGB565 blends fine — ARGB is NOT required
+
+The natural assumption is that hardware-compositing an overlay onto the base needs an alpha
+channel. **The driver says otherwise.** `atmel_hlcdc_plane.c` (XLCDC path, ~line 487) sets the
+blend factors unconditionally for every non-primary plane
+(`SFACTC_A0_MULT_AS`, `DFACTC_M_A0_MULT_AS`, `SFACTA_ONE`, `DFACTA_ONE`) and then:
+
+```c
+if (format->has_alpha)
+        cfg |= ATMEL_XLCDC_LAYER_A0(0xff);              /* per-pixel alpha; A0 pinned opaque */
+else
+        cfg |= ATMEL_XLCDC_LAYER_A0(state->base.alpha); /* the DRM plane alpha property */
+```
+
+So **the overlay blends either way**; the alpha channel only decides where the coefficient
+comes from. `drm_plane_create_alpha_property()` (~line 1021) exposes that property to
+userspace.
+
+| Want | Overlay format | Cost |
+|---|---|---|
+| Fade/dim a whole overlay | **RGB565** + plane `alpha` property | 2 B/px |
+| Hard-edged overlay, transparent background | **RGB565** + `chroma_key` | 2 B/px |
+| Soft per-pixel edges | ARGB8888 (`A0` forced to 0xff) | 4 B/px |
+
+**Which plane gets which property** (`atmel_hlcdc_plane.c`, ~line 1015) — the gating is exact:
+
+| Property | Condition | So on sama7d65 |
+|---|---|---|
+| `alpha` | `type` is OVERLAY or CURSOR | `overlay1`, `high-end-overlay` — **not** `base` |
+| `rotation` (0/90/180/270) | `layout.xstride[0] && layout.pstride[0]` | `overlay1`, `high-end-overlay` — **not** `base` (its layout has `xstride` but **no** `pstride`) |
+| CSC (YUV) | `layout.csc` | `high-end-overlay` only |
+
+So the base layer has neither alpha nor rotation, which matters if rotation was the goal:
+**the full-screen Flutter surface cannot be rotated by the display controller.** Only overlays
+can.
+
+`sama7d65` layers (`atmel_hlcdc_dc.c`, `atmel_xlcdc_sama7d65_layers`): `base`, `overlay1`, and
+`high-end-overlay`. **Both overlays carry `chroma_key` and `chroma_key_mask`** — colour-keyed
+transparency at 16 bpp, which covers most HMI cases (needle, popup, status bar) with no alpha
+channel at all. `high-end-overlay` additionally has `scaler_config`/`hxs_config`/`vxs_config`
+and the YUV format list. All three planes advertise `RGB565`, `XRGB8888` **and** `ARGB8888`
+(`rgb_formats[]`), so format choice is free at the DRM level.
+
+**The base layer stays RGB565 regardless** — nothing about an overlay forces the full-screen
+surface Flutter repaints every frame to 32 bpp, which is the traffic that matters.
+
+**Unverified, check before designing on it:** `atmel_hlcdc_plane.c:678` tests
+`ovl_s->fb->format->has_alpha || ovl_s->alpha != DRM_BLEND_ALPHA_OPAQUE`, probably gating the
+"disc area" optimisation (punching a hole in the base layer so hidden pixels are not fetched).
+If so, a *translucent* overlay forfeits that saving. Not traced.
+
+**The real blocker is unchanged and is not the format: Flutter hands the embedder ONE layer.**
+Getting distinct elements onto separate DRM planes needs the compositor API plus platform
+views — unproven on this embedder, and `disable-plugins` removes the usual machinery.
+
+### Before any of this: measure the swizzle directly
+
+The **2-4 ms** figure is an *inference* from the 10-12.5 ms gap between in-situ and
+content-only runs, and most of that gap is the flip wait. `IVI_SW_PROFILE` plus
+`IVI_SW_STOP_AFTER_FRAMES` gets a direct number in one boot with no code written. **If the
+swizzle is under a millisecond, every GPU and overlay-plane question above is closed on
+arithmetic.** Do not build anything here until that number exists.
+
+Related: there is **no NEON-vs-GPU benchmark** and never was. NEON was never a toggleable
+variable (Skia and `pixel_swizzle.h` are already NEON, the tune is
+`cortexa7hf-neon-vfpv4`), and no Flutter frame has ever gone through libm2d. The only
+GPU-adjacent *score* on record is `glmark2 Score: 1` — which is **software** GL on the CPU
+(softpipe), not the 2D GPU. Do not conflate them.
 
 ### Field findings from the customer pilot
 
