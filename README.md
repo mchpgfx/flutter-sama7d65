@@ -45,103 +45,64 @@ stacked translucency are 2–15× over and must be designed out. See
 Material 3 demo; the USER button on PC10 returns to the menu). It is **panel-size
 agnostic** — see [One image, any panel size](#one-image-any-panel-size).
 
-## Quick start
+## Replicating this build
 
-**Building on a fresh machine? Read [BUILDING.md](BUILDING.md) instead** — it is the
-step-by-step version of this section, aimed at someone who has not seen the project before,
-and it builds the demo image rather than the benchmark one. What follows here is the condensed
-form.
+**The procedure lives in one place: [BUILDING.md](BUILDING.md).** Nine numbered steps from an
+empty machine to the board booting the demo, with the failure mode at each one. It is the
+canonical version — this section is deliberately not a second copy, so there is nothing here to
+drift out of step with it.
 
-
-### 1. Host prerequisites (Ubuntu 24.04)
-
-```bash
-sudo apt-get install -y gawk wget git-core git-lfs diffstat unzip texinfo gcc-multilib \
-  build-essential chrpath socat cpio python3 python3-pip python3-pexpect xz-utils \
-  debianutils iputils-ping python3-git python3-jinja2 libegl1 libsdl1.2-compat-dev \
-  pylint xterm zstd liblz4-tool file locales libacl1
-```
-
-Microchip's own package list is stale on 24.04: `pylint3`→`pylint`,
-`libegl1-mesa`→`libegl1`, `libsdl1.2-dev`→`libsdl1.2-compat-dev`.
-
-**AppArmor blocks BitBake** on 24.04. Grant `userns` to the BitBake binary only, rather than
-disabling the protection system-wide — create `/etc/apparmor.d/bitbake`:
-
-```
-abi <abi/4.0>,
-include <tunables/global>
-profile bitbake /ABSOLUTE/PATH/TO/bitbake/bin/bitbake flags=(unconfined) {
-  userns,
-  include if exists <local/bitbake>
-}
-```
-
-then `sudo apparmor_parser -r /etc/apparmor.d/bitbake`. **The path is hardcoded — regenerate
-it if this workspace moves.**
-
-### 2. Fetch the workspace
+Everything needed is in this repository: the layer revisions are pinned, and
+`conf/templates/default/` carries the entire build configuration. There is no undocumented
+local state.
 
 ```bash
-mkdir -p ~/bin && curl -sSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
-chmod a+x ~/bin/repo && export PATH="$HOME/bin:$PATH"
-
-mkdir yocto && cd yocto
+# The shape of it, in full. Details, prerequisites and verification: BUILDING.md
+mkdir -p ~/yocto && cd ~/yocto
 git clone ssh://git@bitbucket.microchip.com/mg/flutter.git meta-local
 ./meta-local/setup-workspace.sh
-```
-
-`setup-workspace.sh` runs `repo init`/`repo sync` for the Microchip BSP at tag
-`linux4microchip-2026.04`, then clones the two layers that are **not** in that manifest —
-`meta-clang` and `meta-flutter` — at **pinned commits** rather than branch tips:
-
-| Layer | Pinned revision |
-|---|---|
-| `meta-clang` | `cc29beb210ab94eacc53bbd67e287e4e33ede342` (scarthgap) |
-| `meta-flutter` | `719826d2f71076fb616ffea59ee413ad3c62ccba` (scarthgap) |
-
-Pinning matters: following the branch would silently change the Flutter engine version, and
-with it every app bundle. Both live outside the manifest so `repo sync` cannot revert them.
-
-### 3. Configure
-
-```bash
 export TEMPLATECONF=../meta-local/conf/templates/default
-source openembedded-core/oe-init-build-env build     # never pipe this
+source openembedded-core/oe-init-build-env build
+bitbake mchp-flutter-gallery-image
 ```
 
-That is the whole configuration step. The template in this layer seeds
-`build/conf/local.conf` and `build/conf/bblayers.conf` with every setting described in
-[Build configuration](#build-configuration) and the full layer list — including
-`meta-flutter-apps`, which is a **separate layer** inside the meta-flutter checkout and
-easily missed (without it, its ~220 third-party app recipes are invisible and every target
-fails with `Nothing PROVIDES`).
+Three things that bite before you get that far, all covered in BUILDING.md: Ubuntu 24.04
+**needs an AppArmor profile** or BitBake cannot run at all; the host wants **~90 GB free** and
+**16 GB of RAM minimum**; and a first build takes **4–8 hours**.
 
-`TEMPLATECONF` is read **only** when `oe-init-build-env` first creates a build directory. To
-pick up template changes later, either point it at a fresh directory or copy the samples over
-`build/conf/` by hand.
+### What makes it reproducible
 
-`TMPDIR`, `SSTATE_DIR` and `DL_DIR` are `?=` and default to inside `build/`. A Flutter build
-wants **80–120 GB** there; override them in your own `build/conf/local.conf` if that partition
-is small. Note oe-core appends `-glibc`, so `TMPDIR` becomes `tmp-glibc` on disk.
+| Pinned where | What |
+|---|---|
+| `setup-workspace.sh` | BSP manifest tag `linux4microchip-2026.04`; `meta-clang` at `cc29beb2`, `meta-flutter` at `719826d2` — both **outside** the repo manifest, pinned by commit so a moving branch cannot silently change the Flutter engine version and every app bundle with it |
+| `conf/templates/default/local.conf.sample` | `MACHINE`, `DISTRO`, every `PACKAGECONFIG`, the parallelism caps, the armv7 AOT settings — see [Build configuration](#build-configuration) |
+| `conf/templates/default/bblayers.conf.sample` | The full layer list, including `meta-flutter-apps`, which is a *separate* layer inside the meta-flutter checkout. Miss it and ~220 recipes are invisible with `Nothing PROVIDES`. Refers to `meta-local` relatively (`##OEROOT##/../meta-local`), so the workspace is relocatable |
+| this layer | Every override. **Never patch `openembedded-core` or `meta-mchp`** — `repo sync` reverts those silently. See [What is in this layer](#what-is-in-this-layer) |
 
-### 4. Build and flash
+`meta-clang` is **not optional**: `flutter-engine` and `ivi-homescreen` both force
+`TOOLCHAIN = "clang"` with libc++ and compiler-rt, and GCC cannot build this stack.
 
-```bash
-bitbake mchp-flutter-bench-image
+### Iterating on the demo without a full rebuild
+
+Flutter app changes can be checked **on the host** in seconds — the SDK is already in the
+sysroot and ships its own pub cache, so this needs no network:
+
+```sh
+# $TMPDIR-glibc/sysroots-components, NOT tmp-glibc/work - rm_work deletes work dirs.
+SDK=<build>/tmp-glibc/sysroots-components/x86_64/flutter-sdk-native/usr/share/flutter/sdk
+export PATH="$SDK/bin:$PATH" PUB_CACHE="$SDK/.pub-cache"
+
+cd meta-local/recipes-flutter/flutter-demo-menu/files/flutter_demo_menu
+flutter pub get --offline
+flutter analyze
+flutter test          # asserts the UI survives 480x272 through 2048x2048
 ```
 
-Images land in `$TMPDIR-glibc/deploy/images/sama7d65-curiosity-sd/`. Note oe-core appends
-`-glibc` to `TMPDIR`.
+Then rebuild only what changed:
 
-```bash
-# Unmount as a SEPARATE command: a failed umount inside a && chain silently skips the write
-udisksctl unmount -b /dev/mmcblk0p1 ; udisksctl unmount -b /dev/mmcblk0p2
-sudo dd if=<image>.wic of=/dev/mmcblk0 bs=4M conv=fsync status=progress && sync
+```sh
+bitbake -c cleansstate flutter-demo-menu && bitbake mchp-flutter-gallery-image
 ```
-
-Check the target with `lsblk` first. On a desktop session `pkexec` works where `sudo` cannot
-prompt.
 
 ## Running Flutter apps on the board
 
@@ -280,14 +241,8 @@ version hardcoded the string `800x480`, which would have gone on claiming 800x48
 1280x800 panel — a display readout that cannot be wrong is worth the ten lines.
 
 `test/menu_layout_test.dart` asserts no overflow at 480x272, 800x480, 1024x600, 1280x800,
-2048x2048 and two portrait sizes. Run it on the host:
-
-```sh
-SDK=$(dirname $(find ~/yocto-build/tmp-glibc -path '*/flutter/sdk/bin/flutter' | head -1))
-cd meta-local/recipes-flutter/flutter-demo-menu/files/flutter_demo_menu
-PATH="$SDK:$PATH" PUB_CACHE="$(dirname $SDK)/.pub-cache" flutter pub get --offline
-PATH="$SDK:$PATH" PUB_CACHE="$(dirname $SDK)/.pub-cache" flutter test
-```
+2048x2048 and two portrait sizes. It runs on the host in seconds — see
+[Iterating on the demo](#iterating-on-the-demo-without-a-full-rebuild) for the three commands.
 
 That test earned its keep immediately: the menu stacked its two tiles when *width* was
 small, which is backwards — stacking doubles the height needed, so a short landscape panel
@@ -466,7 +421,7 @@ used**: it changes the unpack destination for every git recipe, breaking the man
 - The `repo`-managed layers — pinned by manifest tag instead.
 - Build output (`build/`) — regenerable, and tens of GB.
 - `/etc/apparmor.d/bitbake` — host-local, and it hardcodes an absolute path to the BitBake
-  binary, so each developer generates their own (see [Quick start](#quick-start)).
+  binary, so each developer generates their own (see [BUILDING.md](BUILDING.md)).
 
 ## Troubleshooting
 

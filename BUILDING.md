@@ -22,7 +22,7 @@ after a change are minutes.
 |---|---|
 | OS | Ubuntu 24.04 is what this is verified on. Any distro Yocto scarthgap supports will work, but the package names and the AppArmor step below are Ubuntu-specific. |
 | Disk | **~90 GB free**, on one filesystem if possible. Measured for this exact build: `tmp-glibc` 33 GB, `downloads` 29 GB, `sstate-cache` 12 GB = **74 GB**, plus headroom. (`rm_work` is enabled in the template, which is why this is not 150 GB.) |
-| RAM | **16 GB minimum, 32 GB comfortable.** The template caps parallelism for memory, not cores — see step 3 if you have less. |
+| RAM | **16 GB minimum, 32 GB comfortable.** The template caps parallelism for memory, not cores — see step 5 if you have less. |
 | Network | The first build downloads ~29 GB. |
 | Hardware | SAMA7D65 Curiosity board, its 800×480 LVDS panel, a microSD card (≥ 2 GB), and a card reader. |
 
@@ -142,6 +142,12 @@ directory change is lost.
 That is the entire configuration step. The template in `meta-local` seeds
 `build/conf/local.conf` and `build/conf/bblayers.conf` with every setting this project needs,
 including `MACHINE = "sama7d65-curiosity-sd"`, `DISTRO = "mchp-distro"`, and the full layer list.
+
+That layer list includes **`meta-flutter-apps`**, which is a *separate layer* inside the
+meta-flutter checkout and easily missed when configuring by hand: without it, its ~220
+third-party app recipes are invisible and targets fail with `Nothing PROVIDES`. The template
+also refers to `meta-local` relatively — `##OEROOT##/../meta-local` — so the workspace stays
+relocatable.
 
 **`TEMPLATECONF` is read only when `oe-init-build-env` first creates a build directory.** If you
 later pull template changes from git, either use a fresh build directory or copy

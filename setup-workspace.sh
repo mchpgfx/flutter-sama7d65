@@ -63,7 +63,8 @@ profile and how to verify and flash the result: meta-local/BUILDING.md
 TEMPLATECONF is only read the first time oe-init-build-env runs for a build
 directory; it seeds build/conf/{local,bblayers}.conf from meta-local's template.
 
-TMPDIR/SSTATE_DIR/DL_DIR default to inside build/. A Flutter build wants 80-120 GB
-there - override them in build/conf/local.conf if that partition is small. Note
-oe-core appends "-glibc", so TMPDIR becomes tmp-glibc on disk.
+TMPDIR/SSTATE_DIR/DL_DIR default to inside build/. This build measures ~74 GB
+there (tmp-glibc 33G + downloads 29G + sstate 12G), so allow ~90 GB - override
+them in build/conf/local.conf if that partition is small. Note oe-core appends
+"-glibc", so TMPDIR becomes tmp-glibc on disk.
 EOF

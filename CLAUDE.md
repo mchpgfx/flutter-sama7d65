@@ -18,6 +18,20 @@ Build artefacts are redirected because this directory's partition had only ~73 G
 `/` has ~440 GB. oe-core appends `-glibc` to `TMPDIR` via `TCLIBCAPPEND`, so the configured
 `TMPDIR` of `~/yocto-build/tmp` becomes **`tmp-glibc`** on disk.
 
+## Documentation map — know which file to update
+
+| File | Role |
+|---|---|
+| **`BUILDING.md`** | **The only** step-by-step build procedure: clone → build → verify → flash → boot. Canonical. If a build step changes, it changes here. |
+| `README.md` | Reference: why the configuration is what it is, the measured GUI constraints, troubleshooting. Its "Replicating this build" section is a *pointer* to BUILDING.md plus what makes the build reproducible — deliberately not a second copy of the steps. |
+| `CLAUDE.md` | This file. The same operational knowledge, terser, agent-facing. |
+| `conf/templates/default/conf-notes.txt` | Printed by `oe-init-build-env`. Lists targets; keep in step with the image recipes. |
+| `setup-workspace.sh` | Its closing message repeats the next commands — keep in step with BUILDING.md steps 5-6. |
+
+**Procedure belongs in BUILDING.md only.** It was duplicated between README and BUILDING once;
+the copies drifted within a day (a stale SDK path, a wrong disk figure). Add steps there and
+link to them.
+
 ## Version control
 
 **`meta-local` is a git repo of its own** — remote `origin`
